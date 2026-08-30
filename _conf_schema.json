@@ -1,0 +1,56 @@
+{
+  "prefer_new_domain": {
+    "type": "bool",
+    "description": "使用 2026-08-10 公告的统一域名 api.bot.qq.com（路径 A 会同步改写 botpy Route.DOMAIN，影响该适配器实例的全部请求）",
+    "hint": "旧域名 api.sgroup.qq.com 当前仍可用；官方下线旧域名时再开启即可",
+    "default": false
+  },
+  "sandbox": {
+    "type": "bool",
+    "description": "使用沙箱环境域名 sandbox.api.sgroup.qq.com",
+    "hint": "仅联调测试时开启；路径 A/B 均生效",
+    "default": false
+  },
+  "certified_bot": {
+    "type": "bool",
+    "description": "机器人是否为认证主体，影响主动消息每分钟配额档位（认证 60 条/分钟，未认证 30 条/分钟）",
+    "hint": "按开放平台机器人资质如实勾选",
+    "default": false
+  },
+  "auto_degrade_proactive": {
+    "type": "bool",
+    "description": "被动回复窗口（群 5 分钟/5 次、C2C 60 分钟/4 次）超窗/超次时自动降级为主动消息",
+    "hint": "关闭后超窗将直接抛错（40034005 同类建议），由调用方自行处理",
+    "default": true
+  },
+  "dot_replace": {
+    "type": "bool",
+    "description": "群聊文本中把「字母/汉字.字母/汉字」替换为下划线，规避平台 40054010「不允许发送URL」误拦",
+    "hint": "默认关闭（会改变文本语义）；频繁命中 40054010 时再开启",
+    "default": false
+  },
+  "interaction_auto_ack": {
+    "type": "bool",
+    "description": "收到 INTERACTION_CREATE 后先自动 PUT /interactions/{id} code=0 应答（3 秒时限）再分发给订阅者",
+    "hint": "同一 interaction_id 只能应答一次；需要自定义应答内容的场景可关闭",
+    "default": true
+  },
+  "enable_group_member_events": {
+    "type": "bool",
+    "description": "订阅群成员进出事件（GROUP_MEMBER_ADD/REMOVE，intent 1<<24）",
+    "hint": "botpy 无此 intents 标志位，插件直接置位；仅在 ws identify 时生效，修改后需重载 QQ 官方平台适配器",
+    "default": true
+  },
+  "ref_ttl_days": {
+    "type": "int",
+    "description": "引用索引（msg_idx / ref_idx）本地留存天数",
+    "hint": "JSONL 持久化 + LRU 50000 条；设为 0 表示不落盘（仅内存）",
+    "default": 7
+  },
+  "retry_max": {
+    "type": "int",
+    "description": "命中频控（429/40034100/40034101）时的自动等待重试次数上限",
+    "hint": "401/11244 的 token 重试固定 1 次，不受此项控制",
+    "default": 3
+  }
+}

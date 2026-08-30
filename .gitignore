@@ -205,3 +205,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# AstrBot 本地运行数据（插件数据目录，勿提交）
+data/
