@@ -1,0 +1,5 @@
+name: astrbot_plugin_qqoffice_expand
+desc: QQ 官方机器人扩展能力中台——为其他插件提供群管理/审批/禁言、C2C 输入状态与召回、按钮互动事件、markdown+按钮富消息、菜单与指令面板等 AstrBot 本体未覆盖的 QQ 官方 API 能力。
+author: piexian
+version: 0.1.0
+repo: https://github.com/piexian/astrbot_plugin_qqoffice_expand
