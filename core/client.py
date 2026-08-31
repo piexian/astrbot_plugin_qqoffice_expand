@@ -297,7 +297,9 @@ class QQOfficeClient:
         if http is None:
             raise QQOfficeNotSupported("适配器客户端缺少 _http（botpy BotHttp），无法发起请求")
         route = Route(method, full_path)
-        kwargs: dict[str, Any] = {"timeout": timeout}
+        # botpy BotHttp.request 内部固定注入 client 级 timeout，透传 timeout 会撞关键字；
+        # 路径 A 的 per-request timeout 不可用，仅路径 B（自建 HTTP）生效
+        kwargs: dict[str, Any] = {}
         if params:
             kwargs["params"] = params
         if payload is not None:
