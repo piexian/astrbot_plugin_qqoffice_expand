@@ -185,7 +185,13 @@ def normalize_event(event_name: str, obj: Any) -> QQOfficeEvent:
         type=upper,
         name=event_name,
         raw=raw,
-        payload_id=_field(obj, "id") if not isinstance(obj, dict) else raw.get("id"),
+        # event_id 被动通道要的是网关事件 id：全量 payload 取最外层 id，
+        # botpy 对象取 event_id 属性；d.id 是业务对象 id（如 interaction id），不能当 event_id 用
+        payload_id=(
+            (obj.get("id") if isinstance(obj.get("d"), dict) else raw.get("id"))
+            if isinstance(obj, dict)
+            else (_field(obj, "event_id") or _field(obj, "id"))
+        ),
         scene=scene,
         user_openid=user_openid or _field(author, "user_openid") if author else user_openid,
         group_openid=group_openid,

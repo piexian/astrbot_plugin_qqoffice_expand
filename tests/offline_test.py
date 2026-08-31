@@ -241,6 +241,7 @@ class _InteractionWrap:
     """模拟 botpy Interaction 对象（__slots__ 风格属性）。"""
     def __init__(self):
         self.id = "I-9"
+        self.event_id = "EVT-9"
         self.group_openid = "G9"
         self.data = type("D", (), {
             "type": 1,
@@ -255,6 +256,8 @@ t("normalize interaction data",
   ev3.is_interaction and ev3.interaction_id == "I-9" and ev3.scene == "group"
   and ev3.raw["data"]["resolved"]["button_data"] == "rg2:shoot:G9"
   and ev3.raw["data"]["resolved"]["button_id"] == "rg2_shoot")
+# payload_id 必须是网关事件 id（event_id 属性），不能是 interaction id（d.id）
+t("normalize interaction event_id", ev3.payload_id == "EVT-9")
 
 async def bus_test():
     bus = EventBus({"interaction_auto_ack": True}, None)
