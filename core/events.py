@@ -296,7 +296,7 @@ class AdapterPatcher:
         self._task: asyncio.Task | None = None
         self._patched: dict[int, dict] = {}   # id(client) → 挂载记录（诊断/卸载）
         self._class_parser_names: set[str] = set()
-        self._warned_reload: set[int] = set()
+        self._verdict_tasks: set[asyncio.Task] = set()
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -336,8 +336,10 @@ class AdapterPatcher:
         record = self._patched.get(id(client))
         if record is None:
             record = {"bundle": bundle, "on_added": [], "parser_keys": [],
-                      "intents_applied": [], "original_intents": None}
+                      "intents_applied": [], "original_intents": None,
+                      "ready_event": asyncio.Event(), "warned": False}
             self._patched[id(client)] = record
+            self._mount_ready_hook(client)
 
         self._patch_parsers_class()
         self._patch_parsers_instance(client, record)
@@ -427,21 +429,72 @@ class AdapterPatcher:
         if newly:
             client.intents = intents
             self._log("info", f"适配器 {bundle.instance_id} 追加 intents 位: {newly}")
-        if newly and self._looks_connected(client) and id(client) not in self._warned_reload:
-            self._warned_reload.add(id(client))
-            self._log(
-                "warning",
-                f"适配器 {bundle.instance_id} 已在会话中：新 intents 位仅在下次 identify 生效，"
-                f"请在管理面板重载 QQ 官方平台适配器（或重启 AstrBot）；"
-                f"刚安装本插件后未重启即出现此提示时，重启一次 AstrBot 即可",
-            )
+        if newly:
+            self._schedule_intents_verdict(bundle, record)
+
+    def _schedule_intents_verdict(self, bundle: QQClientBundle, record: dict) -> None:
+        """追加 intents 位后等一次真实 identify：等待期内到达 READY 即视为新位
+        已下发（info）；超时且 ws 已在会话则告警；超时且会话未建立则视为将随
+        首次 identify 生效。"""
+        if bundle.mode != "ws":
+            return
+        client = bundle.client
+
+        async def _verdict():
+            try:
+                await asyncio.wait_for(record["ready_event"].wait(), timeout=5.0)
+                self._log("info", f"适配器 {bundle.instance_id} 的 intents 位已随 identify 生效")
+                return
+            except asyncio.TimeoutError:
+                pass
+            if self._looks_ws_started(client):
+                if record.get("warned"):
+                    return
+                record["warned"] = True
+                self._log(
+                    "warning",
+                    f"适配器 {bundle.instance_id} 已在会话中：新追加的 intents 位未随 identify 下发，"
+                    f"请在管理面板重载 QQ 官方平台适配器（或重启 AstrBot）后生效",
+                )
+            else:
+                self._log("info",
+                          f"适配器 {bundle.instance_id} 尚未建立 ws 会话，intents 将随首次 identify 生效")
+
+        task = asyncio.create_task(_verdict())
+        self._verdict_tasks.add(task)
+        task.add_done_callback(self._verdict_tasks.discard)
+
+    def _mount_ready_hook(self, client) -> None:
+        """链式挂 botpy on_ready（READY 帧经 parser→ws_dispatch 到达），
+        置 record 的 ready_event 唤醒 intents 裁决。"""
+        previous = getattr(client, "on_ready", None)
+
+        async def _on_ready(_prev=previous):
+            for rec in self._patched.values():
+                if rec["bundle"].client is client:
+                    rec["ready_event"].set()
+                    # 重连的新 identify 必然携带已置位的 intents，此前发的告警随之失效
+                    if rec.get("warned"):
+                        rec["warned"] = False
+                        self._log("info",
+                                  f"适配器 {rec['bundle'].instance_id} 重连完成，intents 位已生效")
+            if _prev is not None:
+                result = _prev()
+                if asyncio.iscoroutine(result):
+                    await result
+
+        try:
+            client.on_ready = _on_ready
+        except Exception:
+            pass
+
+    def _looks_ws_started(self, client) -> bool:
+        # botpy 的 _closed 仅在 close() 后为 True，运行中恒为 False，不能当连接信号
+        return getattr(client, "_connection", None) is not None
 
     @staticmethod
     def _looks_connected(client) -> bool:
-        try:
-            return not bool(client.is_closed())
-        except Exception:
-            return False
+        return getattr(client, "_connection", None) is not None
 
     def _mount_handlers(self, client, record: dict) -> None:
         for spec in EVENT_SPECS.values():
@@ -478,6 +531,9 @@ class AdapterPatcher:
         self._inbound_recorder = recorder
 
     async def _unmount_all(self) -> None:
+        for task in self._verdict_tasks:
+            task.cancel()
+        self._verdict_tasks.clear()
         for record in list(self._patched.values()):
             client = record["bundle"].client
             for attr in record["on_added"]:
@@ -485,6 +541,10 @@ class AdapterPatcher:
                     delattr(client, attr)
                 except AttributeError:
                     pass
+            try:
+                delattr(client, "on_ready")  # 还原 botpy 默认空实现
+            except AttributeError:
+                pass
             state = self._get_state(client)
             parsers = getattr(state, "parsers", None) if state is not None else None
             if isinstance(parsers, dict):
@@ -508,7 +568,6 @@ class AdapterPatcher:
                 pass
             self._class_parser_names.clear()
         self._patched.clear()
-        self._warned_reload.clear()
 
     def status(self) -> dict:
         out = []
