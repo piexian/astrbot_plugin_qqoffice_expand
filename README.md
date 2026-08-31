@@ -2,8 +2,8 @@
 
 把 QQ 官方开放平台在 AstrBot 本体（`qq_official` / `qq_official_webhook` 适配器）中缺失的能力封装成稳定接口，供**其他插件**调用，避免各自裸调 `event.bot.api`、重复处理鉴权/频控/错误码。
 
-> ⚠️ **安装本插件后必须重启一次 AstrBot，否则无法注入。**
-> 事件挂载与 intents 置位必须发生在 QQ 官方适配器实例化之前；WebUI 热安装时适配器早已连接，intents 未随 identify 下发，按钮回调/群成员/入群申请等事件一条都收不到。重启一次即恢复。AstrBot 当前不支持调整插件加载顺序，无法用排序绕开此时序。
+> ⚠️ **WebUI 热安装/更新本插件后，请在管理面板重载一次 QQ 官方平台适配器（或重启 AstrBot）。**
+> intents 位只能随 ws identify 下发。插件会类级包装适配器构造函数，在实例化时注入扩展位——此后每次启动/重载都自动携带；但热安装那一刻已在会话中的适配器无法补发 identify，需重载一次适配器，永久生效。若扩展位未在 QQ 开放平台开通权限导致 identify 被网关 4013/4014 拒断，插件会自动剔除扩展位保住基础连接并日志提示，开通权限后重载插件与适配器即可恢复。
 
 ## 环境要求
 
@@ -139,8 +139,8 @@ await svc.send_rich(event, content="收到", reference=svc.reference(svc.ref_fro
 ## 使用前提与已知约束
 
 1. 需先安装本插件；依赖方接入模板见「使用」小节。
-2. **群成员事件（1<<24）仅在 ws identify 时生效**：重启安装后自动生效；运行中开启/修改该配置后，需在管理面板**重载 QQ 官方平台适配器**（或重启 AstrBot），`qqoffice_status` 会提示。
-3. 插件加载顺序不可调：依赖方按「使用」小节的绑定模板接入，本插件 initialize 成功时框架广播且 `svc.ready` 已置位，两种加载顺序都能自动接上。注意：该方案解决的是"拿不到 svc"，不改变热安装需重启的 intents 时序（见顶部警告）。
+2. **扩展 intents 位（群成员 1<<24 / 互动 1<<26 / 审核 1<<27）仅随 ws identify 下发**：构造期注入保证启动与重载适配器时自动携带；运行中修改相关配置后重载一次适配器生效。`qqoffice_status` 的 `session_verdicts` 显示当前会话 identify 载荷实况（`ok` 即已携带）。
+3. 插件加载顺序不可调：依赖方按「使用」小节的绑定模板接入，本插件 initialize 成功时框架广播且 `svc.ready` 已置位，两种加载顺序都能自动接上。注意：该方案解决的是"拿不到 svc"，不改变热安装后需重载一次适配器的 intents 时序（见顶部警告）。
 4. `on_any` 覆盖的是**已挂载**事件类型；官方全新事件在网关层会被 botpy 丢弃，需按 EVENT_SPECS 补一行（设计上的兜底边界）。
 5. 大文件分片上传不复用本插件：AstrBot 自带 `qqofficial_chunked_upload.py` 已处理 40093001 持续重试与 prepare 字符串字段转换，本插件只提供 ≤单请求的 `upload_media`。
 
@@ -164,7 +164,7 @@ await svc.send_rich(event, content="收到", reference=svc.reference(svc.ref_fro
 | 12 | C2C wakeup | `c2c.wakeup(openid, "召回")` | 用户收到召回消息 |
 | 13 | 富媒体 | `upload_media("group", openid, url_or_path, 1)` → media 消息 | 返回 file_info，消息带图 |
 | 14 | 入群申请事件 | 触发进群申请 | on_any/GROUP_JOIN_REQUEST 订阅者收到 |
-| 15 | 群成员事件 | 成员进/退群（先重载适配器确认 1<<24 生效） | GROUP_MEMBER_ADD/REMOVE 到达 |
+| 15 | 群成员事件 | 成员进/退群（确认 `session_verdicts` 为 ok） | GROUP_MEMBER_ADD/REMOVE 到达 |
 | 16 | 菜单/面板 | `manage.menu_put([...])` → `menu_get`；`panel_create(scope="group",...)` → `panel_list` → `panel_target` → `panel_delete` | 配置生效（面板查 QQ 群聊侧） |
 | 17 | 沙箱/域名 | 开 `sandbox` 实测；开 `prefer_new_domain` 观察 botpy 请求域名 | 请求落到对应域名 |
 | 18 | 错误标准化 | 故意传过期 msg_id | 抛 `QQOfficeAPIError(40034005, advice=...)` |

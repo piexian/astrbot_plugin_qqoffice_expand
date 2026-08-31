@@ -5,8 +5,12 @@
 
 patch 收敛在 botpy client/ConnectionState 一层（websocket 与 webhook 的回调
 都经 connection.parser[event] + client.ws_dispatch），不碰 qo_webhook_server：
-① intents 位：仅 ws identify 时生效，已连接需重载平台；群成员 1<<24 在
-  botpy Intents 无标志位，只能 client.intents |= bit，合并而非覆盖。
+① intents 位：构造期注入——类级包装 QQOfficialPlatformAdapter.__init__，
+  适配器每次实例化（启动/面板重载）后即刻置位，先于 botpy _pool_init 的
+  session['intent'] 快照，identify 直接携带，零竞态；运行中后补的位只能
+  写入待连会话，活跃会话需重载一次适配器。网关 4013/4014 拒断时自动剔除
+  扩展位降级，保住基础连接，权限开通并重载后恢复。群成员 1<<24 在 botpy
+  Intents 无标志位，只能 client.intents |= bit，合并而非覆盖。
 ② parsers：botpy 1.2.1 缺 group_member_add/remove/join_request——类级
   setattr（webhook 每次回调懒建新 ConnectionState 实例，只有类级能被自动
   注册）+ 运行中 ws 实例的 state.parsers 直补。
@@ -66,6 +70,16 @@ EVENT_SPECS: dict[str, EventSpec] = {
 
 INTENT_BITS = {"interaction": 1 << 26, "message_audit": 1 << 27, "guild_member": 1 << 24,
                "guild_message_reactions": 1 << 10, "guilds": 1 << 0}
+
+# 插件可能追加的全部 intents 位（与 AstrBot 基础位 1<<30/1<<25/1<<12 无交集，
+# 4013/4014 拒断时整体剔除不会误伤基础订阅）
+_PLUGIN_INTENT_BITS = 0
+for _s in EVENT_SPECS.values():
+    _PLUGIN_INTENT_BITS |= _s.intent or 0
+del _s
+
+# QQ 网关 identify 拒断关闭码：无效 intents / intents 含未授权事件
+_INTENTS_REJECT_CODES = (4013, 4014)
 
 # event_id 被动回复的官方支持范围
 EVENT_ID_SCOPES = {
@@ -296,7 +310,8 @@ class AdapterPatcher:
         self._task: asyncio.Task | None = None
         self._patched: dict[int, dict] = {}   # id(client) → 挂载记录（诊断/卸载）
         self._class_parser_names: set[str] = set()
-        self._verdict_tasks: set[asyncio.Task] = set()
+        self._denied_bits: int = 0          # 被网关 4013/4014 拒授权的位（进程内记忆）
+        self._hooks_installed = False       # 构造期补丁（__init__/on_closed）是否已安装
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -311,6 +326,94 @@ class AdapterPatcher:
                 pass
         self._task = None
         await self._unmount_all()
+
+    # —— 构造期补丁：intents 位随适配器实例化注入，identify 直接携带 ——
+
+    _CTOR_MARK = "_qqoffice_orig_init"
+    _ONCLOSED_MARK = "_qqoffice_orig_on_closed"
+
+    def install_adapter_hooks(self) -> None:
+        """类级包装适配器 __init__ 与 ManagedBotWebSocket.on_closed。
+
+        插件加载早于平台实例化（core_lifecycle 先 reload 插件再 init 平台），
+        此处包装后适配器每次实例化（启动/面板重载）都会自动置位扩展 intents，
+        先于 botpy _pool_init 的 session['intent'] 快照，identify 直接携带。
+        """
+        try:
+            from astrbot.core.platform.sources.qqofficial import (
+                qqofficial_platform_adapter as qoa,
+            )
+        except Exception as exc:
+            self._log("warning", f"适配器模块导入失败，构造期 intents 注入不可用: {exc!r}")
+            return
+        cls = getattr(qoa, "QQOfficialPlatformAdapter", None)
+        if cls is not None and not hasattr(cls, self._CTOR_MARK):
+            orig_init = cls.__init__
+            patcher = self
+
+            def _patched_init(adapter, *args, __orig=orig_init, **kwargs):
+                __orig(adapter, *args, **kwargs)
+                patcher._inject_construction_intents(adapter)
+
+            setattr(cls, self._CTOR_MARK, orig_init)
+            cls.__init__ = _patched_init
+            self._hooks_installed = True
+        ws_cls = getattr(qoa, "ManagedBotWebSocket", None)
+        if ws_cls is not None and not hasattr(ws_cls, self._ONCLOSED_MARK):
+            orig_on_closed = ws_cls.on_closed
+            patcher = self
+
+            async def _patched_on_closed(ws, code, msg, __orig=orig_on_closed):
+                patcher._heal_intents_reject(ws, code, msg)
+                await __orig(ws, code, msg)
+
+            setattr(ws_cls, self._ONCLOSED_MARK, orig_on_closed)
+            ws_cls.on_closed = _patched_on_closed
+            self._hooks_installed = True
+
+    def uninstall_adapter_hooks(self) -> None:
+        """还原构造期补丁；幂等。插件重载顺序为先 terminate 后 load，安全。"""
+        try:
+            from astrbot.core.platform.sources.qqofficial import (
+                qqofficial_platform_adapter as qoa,
+            )
+        except Exception:
+            return
+        cls = getattr(qoa, "QQOfficialPlatformAdapter", None)
+        if cls is not None and hasattr(cls, self._CTOR_MARK):
+            cls.__init__ = getattr(cls, self._CTOR_MARK)
+            delattr(cls, self._CTOR_MARK)
+        ws_cls = getattr(qoa, "ManagedBotWebSocket", None)
+        if ws_cls is not None and hasattr(ws_cls, self._ONCLOSED_MARK):
+            ws_cls.on_closed = getattr(ws_cls, self._ONCLOSED_MARK)
+            delattr(ws_cls, self._ONCLOSED_MARK)
+        self._hooks_installed = False
+
+    def _boot_bits(self) -> int:
+        """构造期应注入的位：启用事件全集减去被网关拒授权的位。"""
+        bits = 0
+        for spec in EVENT_SPECS.values():
+            if spec.intent and self._intent_enabled(spec):
+                bits |= spec.intent
+        return bits & ~self._denied_bits
+
+    def _inject_construction_intents(self, adapter) -> None:
+        """适配器 __init__ 尾部调用：client 已建、run() 未跑，快照尚未发生。"""
+        try:
+            client = getattr(adapter, "client", None)
+            intents = getattr(client, "intents", None)
+            if client is None or not isinstance(intents, int):
+                return
+            bits = self._boot_bits()
+            if not bits or intents & bits == bits:
+                return
+            client.intents = intents | bits
+            base_value = getattr(getattr(adapter, "intents", None), "value", None)
+            if isinstance(base_value, int):
+                adapter.intents.value = base_value | bits  # 保持适配器属性一致
+            self._log("info", f"构造期注入扩展 intents 位 0x{bits:08x}，identify 将直接携带")
+        except Exception as exc:
+            self._log("error", f"构造期注入 intents 失败: {exc!r}")
 
     async def _poll_loop(self) -> None:
         while True:
@@ -337,9 +440,8 @@ class AdapterPatcher:
         if record is None:
             record = {"bundle": bundle, "on_added": [], "parser_keys": [],
                       "intents_applied": [], "original_intents": None,
-                      "ready_event": asyncio.Event(), "warned": False}
+                      "verdict": None}   # None | "ok" | ("missing", bits)，状态变化才重复记录日志
             self._patched[id(client)] = record
-            self._mount_ready_hook(client)
 
         self._patch_parsers_class()
         self._patch_parsers_instance(client, record)
@@ -421,77 +523,97 @@ class AdapterPatcher:
             record["original_intents"] = intents
         newly: list[int] = []
         for spec in specs:
-            if spec.intent and spec.intent not in record["intents_applied"]:
-                if not intents & spec.intent:
-                    intents |= spec.intent  # 合并而非覆盖
-                    newly.append(spec.intent)
-                record["intents_applied"].append(spec.intent)
+            if not spec.intent or spec.intent in record["intents_applied"]:
+                continue
+            if spec.intent & self._denied_bits:
+                continue  # 曾被网关 4013/4014 拒授权，进程内不再置位（防烧 session 配额）
+            if not intents & spec.intent:
+                intents |= spec.intent  # 合并而非覆盖
+                newly.append(spec.intent)
+            record["intents_applied"].append(spec.intent)
         if newly:
             client.intents = intents
             self._log("info", f"适配器 {bundle.instance_id} 追加 intents 位: {newly}")
-        if newly:
-            self._schedule_intents_verdict(bundle, record)
+        self._verify_session_intents(bundle, record)
+    @staticmethod
+    def _collect_sessions(client) -> tuple[list[dict], list[dict]]:
+        """(活跃 ws 会话, 待连会话)。identify 只读 session['intent'] 快照。"""
+        active: list[dict] = []
+        for ws in getattr(client, "_active_websockets", None) or ():
+            session = getattr(ws, "_session", None)
+            if isinstance(session, dict):
+                active.append(session)
+        conn = getattr(client, "_connection", None)
+        pending = [s for s in (getattr(conn, "_session_list", None) or [])
+                   if isinstance(s, dict)]
+        return active, pending
 
-    def _schedule_intents_verdict(self, bundle: QQClientBundle, record: dict) -> None:
-        """追加 intents 位后等一次真实 identify：等待期内到达 READY 即视为新位
-        已下发（info）；超时且 ws 已在会话则告警；超时且会话未建立则视为将随
-        首次 identify 生效。"""
-        if bundle.mode != "ws":
+    def _verify_session_intents(self, bundle: QQClientBundle, record: dict) -> None:
+        """地面真值校验：直接读活跃会话的 session['intent']（identify 实际携带值）。
+
+        待连会话尚未 identify，补位即真实生效；活跃会话缺位只能重载适配器，
+        构造期补丁保证重载后 identify 直接携带，告警按状态变化去重。
+        """
+        required = 0
+        for bit in record["intents_applied"]:
+            required |= bit
+        required &= ~self._denied_bits
+        if not required:
             return
-        client = bundle.client
-
-        async def _verdict():
-            try:
-                await asyncio.wait_for(record["ready_event"].wait(), timeout=5.0)
-                self._log("info", f"适配器 {bundle.instance_id} 的 intents 位已随 identify 生效")
-                return
-            except asyncio.TimeoutError:
-                pass
-            if self._looks_ws_started(client):
-                if record.get("warned"):
-                    return
-                record["warned"] = True
+        active, pending = self._collect_sessions(bundle.client)
+        for session in pending:
+            if isinstance(session.get("intent"), int):
+                session["intent"] |= required  # 尚未 identify，补位即生效
+        if not active:
+            return  # 启动窗口内尚无会话，构造期补丁已保证快照含位
+        missing = 0
+        for session in active:
+            current = session.get("intent")
+            if isinstance(current, int):
+                missing |= required & ~current
+        if not missing:
+            if record.get("verdict") != "ok":
+                record["verdict"] = "ok"
                 self._log(
-                    "warning",
-                    f"适配器 {bundle.instance_id} 已在会话中：新追加的 intents 位未随 identify 下发，"
-                    f"请在管理面板重载 QQ 官方平台适配器（或重启 AstrBot）后生效",
+                    "info",
+                    f"适配器 {bundle.instance_id} 当前会话 identify 载荷已含扩展位 "
+                    f"0x{required:08x}，订阅事件将正常到达",
                 )
-            else:
-                self._log("info",
-                          f"适配器 {bundle.instance_id} 尚未建立 ws 会话，intents 将随首次 identify 生效")
+            return
+        state = ("missing", missing)
+        if record.get("verdict") == state:
+            return
+        record["verdict"] = state
+        self._log(
+            "warning",
+            f"适配器 {bundle.instance_id} 当前会话 identify 载荷缺少扩展位 0x{missing:08x}"
+            f"（会话建立早于置位，本会话收不到对应事件）。"
+            f"请在管理面板重载一次 QQ 官方平台适配器：构造期注入已就位，"
+            f"重载后 identify 直接携带，此后每次启动均自动生效",
+        )
 
-        task = asyncio.create_task(_verdict())
-        self._verdict_tasks.add(task)
-        task.add_done_callback(self._verdict_tasks.discard)
+    def _heal_intents_reject(self, ws, code: int, msg: Any) -> None:
+        """identify 因扩展位被网关 4013/4014 拒断：剔除扩展位让重连立即恢复。
 
-    def _mount_ready_hook(self, client) -> None:
-        """链式挂 botpy on_ready（READY 帧经 parser→ws_dispatch 到达），
-        置 record 的 ready_event 唤醒 intents 裁决。"""
-        previous = getattr(client, "on_ready", None)
-
-        async def _on_ready(_prev=previous):
-            for rec in self._patched.values():
-                if rec["bundle"].client is client:
-                    rec["ready_event"].set()
-                    # 重连的新 identify 必然携带已置位的 intents，此前发的告警随之失效
-                    if rec.get("warned"):
-                        rec["warned"] = False
-                        self._log("info",
-                                  f"适配器 {rec['bundle'].instance_id} 重连完成，intents 位已生效")
-            if _prev is not None:
-                result = _prev()
-                if asyncio.iscoroutine(result):
-                    await result
-
-        try:
-            client.on_ready = _on_ready
-        except Exception:
-            pass
-
-    def _looks_ws_started(self, client) -> bool:
-        # botpy 的 _closed 仅在 close() 后为 True，运行中恒为 False，不能当连接信号
-        return getattr(client, "_connection", None) is not None
-
+        进程内记忆 denied_bits，阻止构造/运行期再次置位，避免重连循环烧
+        session_start 配额；权限开通后重载插件清零记忆即可恢复。
+        """
+        if code not in _INTENTS_REJECT_CODES or not _PLUGIN_INTENT_BITS:
+            return
+        session = getattr(ws, "_session", None)
+        if isinstance(session, dict) and isinstance(session.get("intent"), int):
+            session["intent"] &= ~_PLUGIN_INTENT_BITS
+        client = getattr(ws, "_client", None)
+        intents = getattr(client, "intents", None)
+        if isinstance(intents, int):
+            client.intents = intents & ~_PLUGIN_INTENT_BITS
+        self._denied_bits |= _PLUGIN_INTENT_BITS
+        self._log(
+            "error",
+            f"identify 被网关拒断（close={code} {msg}）：扩展 intents 位未获授权，"
+            f"已自动剔除并降级为 AstrBot 基础订阅，重连即恢复；"
+            f"请到 QQ 开放平台管理端开启对应事件权限后，重载本插件与适配器以恢复扩展事件",
+        )
     @staticmethod
     def _looks_connected(client) -> bool:
         return getattr(client, "_connection", None) is not None
@@ -531,9 +653,6 @@ class AdapterPatcher:
         self._inbound_recorder = recorder
 
     async def _unmount_all(self) -> None:
-        for task in self._verdict_tasks:
-            task.cancel()
-        self._verdict_tasks.clear()
         for record in list(self._patched.values()):
             client = record["bundle"].client
             for attr in record["on_added"]:
@@ -541,10 +660,6 @@ class AdapterPatcher:
                     delattr(client, attr)
                 except AttributeError:
                     pass
-            try:
-                delattr(client, "on_ready")  # 还原 botpy 默认空实现
-            except AttributeError:
-                pass
             state = self._get_state(client)
             parsers = getattr(state, "parsers", None) if state is not None else None
             if isinstance(parsers, dict):
@@ -568,6 +683,7 @@ class AdapterPatcher:
                 pass
             self._class_parser_names.clear()
         self._patched.clear()
+        self.uninstall_adapter_hooks()
 
     def status(self) -> dict:
         out = []
@@ -582,7 +698,10 @@ class AdapterPatcher:
                 "instance_parsers_added": record["parser_keys"],
                 "intents_applied": [hex(b) for b in record["intents_applied"]],
             })
-        return {"clients": out, "class_parsers": sorted(self._class_parser_names)}
+        return {"clients": out, "class_parsers": sorted(self._class_parser_names),
+                "ctor_hook": self._hooks_installed, "denied_bits": hex(self._denied_bits),
+                "session_verdicts": {r["bundle"].instance_id: r.get("verdict")
+                                     for r in self._patched.values()}}
 
     def _log(self, level: str, msg: str) -> None:
         if self.logger:

@@ -117,6 +117,7 @@ class Main(Star):
             self.event_bus, cfg, logger,
         )
         self.patcher.set_inbound_recorder(self._record_inbound)
+        self.patcher.install_adapter_hooks()  # 构造期注入，必须先于平台实例化
         self.event_bus.set_ack_caller(self._ack_interaction)
         self.event_bus._on_first_subscribe = make_first_subscribe_hook(self.patcher)
 
