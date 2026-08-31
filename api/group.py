@@ -153,22 +153,17 @@ class GroupAPI:
         )
 
     async def strategy_update(self, strategy_id: str, *, is_enable: str | None = None,
-                              expire_at: str | None = None,
-                              add_group_openids: list[str] | None = None,
-                              del_group_openids: list[str] | None = None,
-                              add_group_ids: list | None = None,
-                              del_group_ids: list | None = None,
+                              expire_at: str | None = None, remark: str | None = None,
+                              group_action: dict | None = None,
                               extra: dict | None = None) -> dict:
-        """修改策略（PATCH）：状态/失效时间/增删关联群。字段名以官方文档为准，
-        未列出的字段放 extra。"""
+        """修改策略（PATCH）：group_action 为 {"op": "add|del", "group_openids": [...]
+        或 "group_ids": [...]}，群标识形式须与创建时一致；单次只能 add 或 del。"""
         body: dict[str, Any] = dict(extra or {})
-        for k, v in (
-            ("is_enable", is_enable), ("expire_at", expire_at),
-            ("add_group_openids", add_group_openids), ("del_group_openids", del_group_openids),
-            ("add_group_ids", add_group_ids), ("del_group_ids", del_group_ids),
-        ):
+        for k, v in (("is_enable", is_enable), ("expire_at", expire_at), ("remark", remark)):
             if v is not None:
                 body[k] = v
+        if group_action:
+            body["group_action"] = group_action
         return await self._client.call(
             "PATCH", "/v2/groups/join_approval_strategy/{strategy_id}",
             path_params={"strategy_id": strategy_id}, json=body, scene="group",

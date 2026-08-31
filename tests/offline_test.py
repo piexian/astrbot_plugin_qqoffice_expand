@@ -200,6 +200,11 @@ t("group.approve", k["json"] == {"op": "decline", "reject_reason": "r", "add_to_
 asyncio.run(g.strategy_whitelist("S1", "add", ["123"]))
 a, k = cap.calls[-1]
 t("group.whitelist", a[1] == "/v2/groups/join_approval_strategy/{strategy_id}/whitelist_users")
+asyncio.run(g.strategy_update("S1", is_enable="off", group_action={"op": "add", "group_openids": ["G1"]}))
+a, k = cap.calls[-1]
+t("group.strategy_update", a[0] == "PATCH" and k["json"]["is_enable"] == "off"
+  and k["json"]["group_action"] == {"op": "add", "group_openids": ["G1"]}
+  and "add_group_openids" not in k["json"])
 
 c = C2CAPI(cap)
 asyncio.run(c.wakeup("U1", "hi"))
@@ -258,6 +263,10 @@ t("normalize interaction data",
   and ev3.raw["data"]["resolved"]["button_id"] == "rg2_shoot")
 # payload_id 必须是网关事件 id（event_id 属性），不能是 interaction id（d.id）
 t("normalize interaction event_id", ev3.payload_id == "EVT-9")
+
+# FRIEND_ADD 的用户字段是 openid 而非 user_openid
+ev4 = normalize_event("friend_add", {"d": {"id": "F1", "openid": "U-F", "scene": 1001}})
+t("normalize friend_add openid", ev4.user_openid == "U-F" and ev4.scene == "c2c")
 
 async def bus_test():
     bus = EventBus({"interaction_auto_ack": True}, None)

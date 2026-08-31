@@ -300,6 +300,10 @@ class Main(Star):
             payload["media"] = media
         else:
             payload.setdefault("msg_type", 2 if markdown else 0)
+        if markdown and content:
+            # 官方约束：传 markdown 时 content 必须为空，否则 22006
+            logger.warning("[qqoffice_expand] markdown 与 content 互斥：已丢弃 content")
+            content = None
         if content:
             payload["content"] = content
         if markdown:

@@ -166,7 +166,11 @@ def normalize_event(event_name: str, obj: Any) -> QQOfficeEvent:
 
     scene = None
     group_openid = raw.get("group_openid") or _field(obj, "group_openid")
-    user_openid = raw.get("user_openid") or _field(obj, "user_openid")
+    # FRIEND_ADD 等事件的用户字段名是 openid 而非 user_openid
+    user_openid = (
+        raw.get("user_openid") or raw.get("openid")
+        or _field(obj, "user_openid") or _field(obj, "openid")
+    )
     member_openid = (
         raw.get("group_member_openid")
         or raw.get("op_member_openid")
