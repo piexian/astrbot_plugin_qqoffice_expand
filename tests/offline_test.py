@@ -237,6 +237,25 @@ class _Wrap:
 ev2 = normalize_event("group_del_robot", _Wrap())
 t("normalize wrapper", ev2.scene == "group" and ev2.member_openid == "M2" and ev2.payload_id == "E2")
 
+class _InteractionWrap:
+    """模拟 botpy Interaction 对象（__slots__ 风格属性）。"""
+    def __init__(self):
+        self.id = "I-9"
+        self.group_openid = "G9"
+        self.data = type("D", (), {
+            "type": 1,
+            "resolved": type("R", (), {
+                "button_data": "rg2:shoot:G9",
+                "button_id": "rg2_shoot",
+                "message_id": "M-9",
+            })(),
+        })()
+ev3 = normalize_event("interaction_create", _InteractionWrap())
+t("normalize interaction data",
+  ev3.is_interaction and ev3.interaction_id == "I-9" and ev3.scene == "group"
+  and ev3.raw["data"]["resolved"]["button_data"] == "rg2:shoot:G9"
+  and ev3.raw["data"]["resolved"]["button_id"] == "rg2_shoot")
+
 async def bus_test():
     bus = EventBus({"interaction_auto_ack": True}, None)
     got, any_got = [], []

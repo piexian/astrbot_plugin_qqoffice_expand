@@ -145,6 +145,23 @@ def normalize_event(event_name: str, obj: Any) -> QQOfficeEvent:
             "guild_id": _field(obj, "guild_id"),
             "channel_id": _field(obj, "channel_id"),
         }
+        # INTERACTION_CREATE 的按钮数据在 data.resolved 里，一并搬入 raw
+        data_obj = _field(obj, "data")
+        if data_obj is not None:
+            resolved_obj = _field(data_obj, "resolved")
+            resolved = {
+                k: v
+                for k, v in {
+                    "button_data": _field(resolved_obj, "button_data"),
+                    "button_id": _field(resolved_obj, "button_id"),
+                    "message_id": _field(resolved_obj, "message_id"),
+                }.items()
+                if v is not None
+            }
+            raw["data"] = {"resolved": resolved}
+            data_type = _field(data_obj, "type")
+            if data_type is not None:
+                raw["data"]["type"] = data_type
         raw = {k: v for k, v in raw.items() if v is not None}
 
     scene = None
