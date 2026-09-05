@@ -37,7 +37,7 @@ class C2CAPI(MediaAPI):
     async def send(self, openid: str, content: str, *, msg_id: str | None = None,
                    event_id: str | None = None, msg_seq: int | None = None,
                    extra: dict | None = None) -> dict:
-        """发送单聊文本消息（msg_type=0）。富消息用 svc.send_rich。
+        """发送单聊文本消息（msg_type=0）。富消息用视图的 send_rich。
         被动窗口 60 分钟/4 次（与群 5 分钟/5 次不同）。"""
         body: dict[str, Any] = {"msg_type": 0, "content": content}
         body.update(extra or {})

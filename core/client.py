@@ -1,9 +1,16 @@
-"""通用 call 通道（扩展位核心），路径 A/B 在此收敛。
+"""绑定视图的通用调用通道（N 实例版）。
 
-内建：端点频控、主动消息配额、无状态 msg_seq、被动窗口自动降级（群 5min/5
-次、C2C 60min/4 次）、401/11244 清 token 重试一次、429/40034100 与流式
-50002 频控等待重试、HTML 网关页识别、错误标准化、出站 ref_idx 入引用索引、群文本
-点号替换（可选）。超时按路径自适应：含 /files、upload_ 的 120s，其余 30s。
+流程与设计第 5 节一致：
+1. 解析来源（resolve）并固定 OperationContext（同一操作全程使用）；
+2. 在所属 RobotState 申请被动窗口预留 / 主动配额；
+3. 限流等待结束后 check_context 再核验代次，动态取当前 HTTP；
+4. 调用该 HTTP；重试前再次核验（不跨机器人/代次重放）。
+
+重试语义：网关/超时对**写操作**不自动重发（结果未知不盲放）；只对
+安全查询（GET）和明确的 token/频控拒绝重试。被动预留只在「确定未发送」
+时释放；发送结果未知按已消耗处理。
+
+上传与发送共享同一 OperationContext（send_rich 富媒体流程不跨代次）。
 """
 
 from __future__ import annotations
@@ -13,72 +20,30 @@ import base64
 import random
 import re as _re
 import time
-from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 from . import errors as qo_errors
-from .auth import QQClientBundle, SelfClient
 from .errors import QQOfficeAPIError, QQOfficeGatewayError, QQOfficeNotSupported
-from .ratelimit import RateLimiter
-from .refstore import RefStore
 from .http_capture import capture_response_status
+from .routing import (
+    BoundSource,
+    OperationContext,
+    PassiveWindows,
+    RobotState,
+    RouteCore,
+)
 
-__all__ = ["QQOfficeClient", "PassiveWindowTracker", "generate_msg_seq"]
-
-DEFAULT_TIMEOUT = 30.0
-UPLOAD_TIMEOUT = 120.0  # 上传类接口平台侧耗时，普通 30s 会误超时
+__all__ = ["generate_msg_seq", "resolve_endpoint_key", "execute_call",
+           "send_rich_bound", "upload_media_bound"]
 
 _DOT_RE = _re.compile(r"([A-Za-z0-9\u4e00-\u9fff])\.([A-Za-z0-9\u4e00-\u9fff])")
+
 
 def generate_msg_seq() -> int:
     """无状态生成，规避相同 msg_id+msg_seq 的平台去重报错。"""
     return (int(time.time() * 1000) % 100_000_000) ^ random.getrandbits(16)
 
-class PassiveWindowTracker:
-    """per msg_id 被动回复窗口与次数（官方限制：群 5min/5 次、C2C 60min/4 次）。"""
-
-    LIMITS = {"group": (300.0, 5), "c2c": (3600.0, 4)}
-    _GC_TTL = 3600.0
-
-    def __init__(self):
-        self._records: dict[str, tuple[float, int, float, str]] = {}
-
-    def check(self, scene: str, msg_id: str) -> tuple[bool, str]:
-        """(是否仍可被动回复, 原因)。"""
-        window, max_count = self.LIMITS.get(scene, (0.0, 0))
-        if not window:
-            return True, ""
-        rec = self._records.get(msg_id)
-        if rec is None:
-            return True, ""
-        first_ts, count, last_ts, _ = rec
-        now = time.monotonic()
-        if now - first_ts > window:
-            return False, "窗口已过期"
-        if count >= max_count:
-            return False, f"已达被动回复上限（{max_count} 次）"
-        return True, ""
-
-    def record(self, scene: str, msg_id: str) -> None:
-        if scene not in self.LIMITS or not msg_id:
-            return
-        now = time.monotonic()
-        rec = self._records.get(msg_id)
-        if rec is None or now - rec[0] > self.LIMITS[scene][0]:
-            self._records[msg_id] = (now, 1, now, scene)
-        else:
-            self._records[msg_id] = (rec[0], rec[1] + 1, now, scene)
-        self._gc()
-
-    def _gc(self) -> None:
-        if len(self._records) < 512:
-            return
-        now = time.monotonic()
-        for k in [k for k, v in self._records.items() if now - v[2] > self._GC_TTL]:
-            self._records.pop(k, None)
-
-    def stats(self) -> dict:
-        return {"tracked_msg_ids": len(self._records)}
 
 # 端点 key 解析表（顺序敏感；新端点在此加一行即可）
 _ENDPOINT_PATTERNS: list[tuple[_re.Pattern, str]] = [
@@ -110,6 +75,7 @@ _ENDPOINT_PATTERNS: list[tuple[_re.Pattern, str]] = [
     (_re.compile(r"^/users/@me$"), "bot.me"),
 ]
 
+
 def resolve_endpoint_key(method: str, path: str, scene: str | None) -> str:
     key_tpl: str | None = None
     for pattern, tpl in _ENDPOINT_PATTERNS:
@@ -132,351 +98,414 @@ def resolve_endpoint_key(method: str, path: str, scene: str | None) -> str:
         return "panels.get" if method.upper() == "GET" else "panels.write"
     if key_tpl == "panels.list_or_create":
         return "panels.list" if method.upper() == "GET" else "panels.write"
-    if key_tpl == "{scene}.mute_get" :
-        return key_tpl
     return key_tpl.format(scene=scene) if "{scene}" in key_tpl else key_tpl
 
-class QQOfficeClient:
-    """面向其他插件的通用请求通道；路径 A/B 细节全部在此收敛。"""
 
-    def __init__(
-        self,
-        *,
-        bundle: QQClientBundle | None = None,
-        self_client: SelfClient | None = None,
-        rate_limiter: RateLimiter,
-        refstore: RefStore,
-        config: dict | None = None,
-        logger=None,
-    ):
-        if (bundle is None) == (self_client is None):
-            raise ValueError("bundle 与 self_client 必须二选一")
-        self.bundle = bundle
-        self.self_client = self_client
-        self.limiter = rate_limiter
-        self.refstore = refstore
-        self.config = dict(config or {})
-        self.logger = logger
-        self.mode = "adapter" if bundle is not None else "self"
-        self.windows = PassiveWindowTracker()
-        self.recent_errors: deque[dict] = deque(maxlen=10)
-        self.calls_total = 0
+_SAFE_QUERY_METHODS = frozenset({"GET"})
+_WRITE_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
+"""网关错误/超时（结果未知）时允许自动重试的方法。
 
-    @property
-    def appid(self) -> str:
-        return self.bundle.appid if self.bundle else (self.self_client.appid if self.self_client else "")
+仅显式安全（幂等只读）请求；POST/PUT/DELETE（发送、撤回、禁言、ACK、
+上传等）结果未知时不重放。
+"""
 
-    def _log(self, level: str, msg: str) -> None:
-        if self.logger:
-            getattr(self.logger, level)(f"[qqoffice_expand] {msg}")
 
-    def _record_error(self, err: Exception) -> None:
-        self.recent_errors.append({"ts": time.strftime("%H:%M:%S"), "err": repr(err)[:200]})
+class _SafeDict(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
 
-    async def call(
-        self,
-        method: str,
-        path: str,
-        *,
-        path_params: dict | None = None,
-        params: dict | None = None,
-        json: dict | None = None,
-        scene: str | None = None,
-        target_openid: str | None = None,
-        endpoint_key: str | None = None,
-        msg_id: str | None = None,
-        event_id: str | None = None,
-        msg_seq: int | None = None,
-        timeout: float | None = None,
-    ) -> dict | list:
-        """调用任意官方端点，保留响应对象或数组（错误抛 QQOfficeAPIError 系）。"""
-        method = method.upper()
-        path_params = dict(path_params or {})
-        try:
-            full_path = path.format_map(_SafeDict(path_params))
-        except ValueError as e:
-            raise QQOfficeNotSupported(f"路径参数展开失败: {path} {path_params} ({e})")
-        missing = _re.findall(r"\{(\w+)\}", full_path)
-        if missing:
-            raise QQOfficeNotSupported(f"路径缺少参数 {missing}: {path}")
 
-        endpoint_key = endpoint_key or resolve_endpoint_key(method, full_path, scene)
-        self.calls_total += 1
+@dataclass
+class _Reservation:
+    """一次成功的被动窗口预留；只由其归属的操作按语义释放。"""
 
-        payload = dict(json or {})
-        is_stream = endpoint_key == "c2c.stream"
-        is_send = (endpoint_key.endswith(".send") or is_stream
-                   or (endpoint_key.endswith(".files") and bool(payload.get("srv_send_msg"))))
-        # 流式续片属于同一条回复，不能每片都扣掉一次普通消息的回复额度。
-        continuation = is_stream and bool(payload.get("stream_msg_id"))
-        degraded = False
-        stream_reply_id = msg_id or payload.get("msg_id")
-        if is_stream and not continuation and stream_reply_id and not payload.get("is_wakeup"):
-            ok, reason = self.windows.check("c2c", stream_reply_id)
-            if not ok:
-                # 静默降级首片会使调用方沿用的续片引用参数与首片不一致。
-                raise QQOfficeAPIError(40034128, f"流式被动回复窗口失效（{reason}），请显式发起主动流")
-        if is_send and not continuation:
-            payload, degraded = await self._prepare_message_payload(
-                payload, scene, target_openid,
-                None if is_stream and payload.get("is_wakeup") else msg_id, event_id, msg_seq
+    windows: PassiveWindows
+    scene: str
+    target: str
+    msg_id: str
+
+    def release_if_unused(self) -> None:
+        self.windows.release(self.scene, self.target, self.msg_id)
+
+
+async def execute_call(svc, bound: BoundSource, method: str, path: str,
+                       **kwargs) -> dict | list:
+    """通用通道入口：BoundView.call / 命名方法 / send_rich 全部经过这里。
+
+    kwargs: path_params/params/json/scene/target_openid/endpoint_key/
+    msg_id/event_id/msg_seq/_ctx（富媒体流程传入的固定上下文）/
+    _phase（ACK 等调用方的阶段跟踪器：进入 SDK 前后语义不同）。
+    """
+    method = method.upper()
+    routes: RouteCore = svc.routes
+    phase = kwargs.pop("_phase", None)
+    ctx: OperationContext | None = kwargs.pop("_ctx", None)
+    if ctx is not None:
+        # 富媒体流程的后续步骤：不重新取代次，直接核验既有上下文。
+        route = routes.ensure_current_route(ctx.platform_id)
+        http = routes.check_context(ctx)
+    else:
+        route, http = routes.resolve(bound)
+        ctx = routes.operation(route)
+    state = routes.state_for(route.robot_key)
+    state.touch()
+    state.retain()   # 在途归属：等待/重试期间状态不被后台清理回收
+    try:
+        return await _execute_call_body(svc, routes, bound, ctx, route, state,
+                                        method, path, kwargs, http, phase)
+    finally:
+        state.release()
+
+
+async def _execute_call_body(svc, routes, bound, ctx, route, state, method,
+                             path, kwargs, http, phase):
+    path_params = dict(kwargs.get("path_params") or {})
+    try:
+        full_path = path.format_map(_SafeDict(path_params))
+    except ValueError as e:
+        raise QQOfficeNotSupported(f"路径参数展开失败: {path} {path_params} ({e})")
+    missing = _re.findall(r"\{(\w+)\}", full_path)
+    if missing:
+        raise QQOfficeNotSupported(f"路径缺少参数 {missing}: {path}")
+
+    scene = kwargs.get("scene")
+    target = kwargs.get("target_openid")
+    endpoint_key = kwargs.get("endpoint_key") or resolve_endpoint_key(method, full_path, scene)
+    payload = dict(kwargs.get("json") or {})
+    refstore = svc.refstore
+    prefix = route.robot_key.prefix()
+
+    is_stream = endpoint_key == "c2c.stream"
+    is_send = (endpoint_key.endswith(".send") or is_stream
+               or (endpoint_key.endswith(".files") and bool(payload.get("srv_send_msg"))))
+    continuation = is_stream and bool(payload.get("stream_msg_id"))
+    # 回复字段统一从 payload 取（api 层与 send_rich 都已并入 payload），
+    # 兼容旧式 kwargs 直传：同步进 payload，保持单一事实来源。
+    for key in ("msg_id", "event_id", "msg_seq"):
+        if kwargs.get(key) is not None and key not in payload:
+            if key == "msg_seq" and "msg_id" not in payload and "event_id" not in payload:
+                continue
+            payload[key] = kwargs[key]
+
+    # —— 被动窗口预留（无 await；群/C2C 按身份+scene+target+msg_id 隔离）——
+    reservation: _Reservation | None = None
+    degraded_from = None
+    if is_stream and not continuation and payload.get("msg_id") and not payload.get("is_wakeup"):
+        ok, reason = state.windows.reserve("c2c", target, payload["msg_id"])
+        if not ok:
+            raise QQOfficeAPIError(
+                40034128, f"流式被动回复窗口失效（{reason}），请显式发起主动流"
             )
-            if degraded:
-                self._log("warning", f"被动窗口失效，已降级为主动消息: target={target_openid}")
-        elif continuation:
-            for key, value in (("msg_id", msg_id), ("event_id", event_id), ("msg_seq", msg_seq)):
-                if value is not None:
-                    payload[key] = value
+        reservation = _Reservation(state.windows, "c2c", target, payload["msg_id"])
+    elif is_send and not continuation:
+        msg_id = payload.get("msg_id")
+        if msg_id and scene in PassiveWindows.LIMITS:
+            ok, reason = state.windows.reserve(scene, target, msg_id)
+            if not ok:
+                if not svc.config.get("auto_degrade_proactive", True):
+                    raise QQOfficeAPIError(
+                        40034005, f"被动回复窗口失效（{reason}），且未开启自动降级"
+                    )
+                degraded_from = msg_id
+                payload.pop("msg_id", None)
+                payload.pop("msg_seq", None)
+            else:
+                reservation = _Reservation(state.windows, scene, target, msg_id)
+                if "msg_seq" not in payload:
+                    payload["msg_seq"] = (
+                        kwargs.get("msg_seq") if kwargs.get("msg_seq") is not None
+                        else generate_msg_seq()
+                    )
 
-        await self.limiter.acquire(endpoint_key, target=target_openid if scene == "guild" else None)
+    _reached_sdk = False
+    _last_definitive = False   # 最近一次响应是官方明确拒绝（确定未生效）
+    try:
+        # —— 主动配额：只对真正的主动消息消费（被动回复/降级前不发）——
+        is_proactive = (is_send and "msg_id" not in payload
+                        and "event_id" not in payload and not payload.get("is_wakeup"))
+        if is_proactive and target and scene in ("group", "c2c"):
+            await state.rate.consume_proactive(str(target), scene=scene)
+            http = routes.check_context(ctx)   # 等待后核验
 
-        if timeout is None:
-            timeout = UPLOAD_TIMEOUT if ("/files" in full_path or "upload_" in full_path) else DEFAULT_TIMEOUT
+        # —— 端点频控等待（await；尚未进入 SDK，可安全中断）——
+        await state.rate.acquire(endpoint_key, target=target if scene == "guild" else None)
+        http = routes.check_context(ctx)   # 限流等待后再核验，动态取当前 HTTP
 
+        if (svc.config.get("dot_replace", False) and scene == "group"
+                and isinstance(payload.get("content"), str)):
+            payload["content"] = _DOT_RE.sub(r"\1_\2", payload["content"])
+        if degraded_from is not None:
+            state._log_degrade(svc, scene, target, degraded_from)
+
+        # —— 发送循环。阶段语义：
+        #   pre_dispatch：进入 http.request 前（确定未发送）→ 可退预留
+        #   in_flight：http.request 已调用（结果未知）→ 保留消费
+        # 重试只对：token/429 明确拒绝（写/读皆可）、安全查询的网关错误。
         token_retry_used = False
         rate_attempts = 0
-        retry_max = int(self.config.get("retry_max", 3) or 0)
+        retry_max = int(svc.config.get("retry_max", 3) or 0)
         while True:
             try:
-                result = await self._dispatch(method, full_path, params, payload if payload else None, timeout)
+                _reached_sdk = True   # 即将进入 SDK（http.request）
+                _last_definitive = False   # 新尝试开始：上一次的明确拒绝不再代表本次
+                if phase is not None:
+                    phase.reached_sdk = True
+                    phase.definitive_rejected = False
+                result = await _dispatch(http, method, full_path,
+                                         kwargs.get("params"), payload if payload else None)
             except QQOfficeAPIError as exc:
-                self._record_error(exc)
-                if not token_retry_used and (exc.code == 401 or exc.code in qo_errors.TOKEN_EXPIRED_CODES):
+                _record_error(state, exc)
+                _last_definitive = True   # 明确 API 拒绝：确定未生效
+                if phase is not None:
+                    phase.definitive_rejected = True
+                if (not token_retry_used
+                        and (exc.code == 401 or exc.code in qo_errors.TOKEN_EXPIRED_CODES)):
                     token_retry_used = True
-                    await self._refresh_token()
+                    http = await _refresh_token(routes, ctx)
                     continue
-                if exc.code == 429 or exc.code in qo_errors.RATE_LIMITED_CODES or (is_stream and exc.code == 50002):
+                if (exc.code == 429 or exc.code in qo_errors.RATE_LIMITED_CODES
+                        or (is_stream and exc.code == 50002)):
                     if rate_attempts < retry_max:
                         rate_attempts += 1
                         await asyncio.sleep(min(30.0, 1.0 * rate_attempts))
+                        http = routes.check_context(ctx)
                         continue
+                _fail(reservation)
+                reservation = None
+                if phase is not None:
+                    phase.definitive_rejected = True
                 raise
             except QQOfficeGatewayError as exc:
-                self._record_error(exc)
-                if rate_attempts < retry_max:
+                _record_error(state, exc)
+                # 未知网关结果：写操作不盲重放、不退款；安全查询可重试
+                if (not is_send and method in _SAFE_QUERY_METHODS
+                        and rate_attempts < retry_max):
                     rate_attempts += 1
                     await asyncio.sleep(min(15.0, 2.0 * rate_attempts))
+                    http = routes.check_context(ctx)
                     continue
+                reservation = None   # 未知结果：保留消费，外层不再退
+                if phase is not None:
+                    phase.unknown = True
                 raise
             break
+    except (asyncio.CancelledError, Exception):
+        # 进入 SDK 前的失败：确定未发送 → 退预留。
+        # 进入 SDK 后：仅当最近响应是官方明确拒绝（确定未生效）才退；
+        # 其余取消/未知异常结果可能已生效 → 保留消费。
+        if not _reached_sdk or _last_definitive:
+            _fail(reservation)
+        raise
 
-        if isinstance(result, dict):
-            refstore = self.refstore
-            if is_send and scene and target_openid:
-                refstore.record_outbound(scene, target_openid, result)
-            if is_send and not continuation and not payload.get("is_wakeup"):
-                used_msg_id = payload.get("msg_id")
-                if used_msg_id:
-                    self.windows.record(scene or "group", used_msg_id)
-        return result if isinstance(result, (dict, list)) else {}
+    # —— 出站引用入库（带身份前缀）；预留默认归宿为已消耗 ——
+    if isinstance(result, dict) and is_send and scene and target:
+        refstore.record_outbound(f"{prefix}|{scene}", target, result)
+    return result if isinstance(result, (dict, list)) else {}
 
-    async def _prepare_message_payload(
-        self,
-        payload: dict,
-        scene: str | None,
-        target_openid: str | None,
-        msg_id: str | None,
-        event_id: str | None,
-        msg_seq: int | None,
-    ) -> tuple[dict, bool]:
-        """补 msg_seq、处理被动窗口降级、点号替换；返回 (payload, 是否降级)。"""
-        payload = dict(payload)
-        degraded = False
 
-        # 被动通道：msg_id（窗口内）或 event_id（官方支持事件范围由调用方保证）
-        if msg_id and scene in PassiveWindowTracker.LIMITS:
-            ok, reason = self.windows.check(scene, msg_id)
-            if not ok:
-                if self.config.get("auto_degrade_proactive", True):
-                    msg_id = None
-                    payload.pop("msg_id", None)
-                    payload.pop("msg_seq", None)
-                    degraded = True
-                else:
-                    raise QQOfficeAPIError(40034005, f"被动回复窗口失效（{reason}），且未开启自动降级")
-        if msg_id:
-            payload["msg_id"] = msg_id
-            payload.setdefault("msg_seq", msg_seq if msg_seq is not None else generate_msg_seq())
-        elif event_id:
-            payload["event_id"] = event_id
+def _fail(reservation: _Reservation | None) -> None:
+    """确定未发送时释放预留；reservation 为 None 表示已按消耗处理。"""
+    if reservation is not None:
+        reservation.release_if_unused()
 
-        # 纯主动消息才消耗配额（被动回复不受主动配额限制）
-        if "msg_id" not in payload and "event_id" not in payload and not payload.get("is_wakeup"):
-            if target_openid and scene in ("group", "c2c"):
-                await self.limiter.consume_proactive(str(target_openid), scene=scene)
 
-        if (
-            self.config.get("dot_replace", False)
-            and scene == "group"
-            and isinstance(payload.get("content"), str)
-        ):
-            payload["content"] = _DOT_RE.sub(r"\1_\2", payload["content"])
-        return payload, degraded
+async def _dispatch(http, method: str, full_path: str, params: dict | None,
+                    payload: dict | None) -> dict | list:
+    """通过当前 botpy BotHttp 发请求；保留原错误标准化与空响应区分。
 
-    async def _dispatch(self, method: str, full_path: str, params: dict | None,
-                        payload: dict | None, timeout: float) -> dict | list:
-        if self.bundle is not None:
-            return await self._dispatch_adapter(method, full_path, params, payload, timeout)
-        return await self._dispatch_self(method, full_path, params, payload, timeout)
+    SDK 对 200/204 空响应和超时都返回 None；超时/网关错误在这里按
+    captured 状态区分并抛 QQOfficeGatewayError（写操作由上层裁决不重放）。
+    写操作临时禁用 botpy 内部的 ConnectionReset 自动重发（结果未知不重放
+    是插件语义，SDK 递归重试会绕过它）。
+    """
+    try:
+        import botpy.http as botpy_http
+    except Exception as e:  # pragma: no cover
+        raise QQOfficeNotSupported(f"botpy 不可用: {e}")
 
-    async def _dispatch_adapter(self, method: str, full_path: str, params: dict | None,
-                                payload: dict | None, timeout: float) -> dict | list:
+    route = botpy_http.Route(method, full_path)
+    kwargs: dict[str, Any] = {}
+    if params:
+        kwargs["params"] = params
+    if payload is not None:
+        kwargs["json"] = payload
+    captured: dict = {}
+    # 写操作：把 botpy 内部 ConnectionReset 递归重试的余量耗尽（初始
+    # retry_time=2 → SDK 内部重试一次后 retry_time=3 即放弃），SDK 不会
+    # 重放写请求，结果未知按上层网关错误处理。读取保持 SDK 默认重试。
+    sdk_retry_time = 2 if method in _WRITE_METHODS else 0
+    try:
+        with capture_response_status(botpy_http) as captured:
+            result = await http.request(route, retry_time=sdk_retry_time, **kwargs)
+    except Exception as exc:
+        err = captured.get("error") or qo_errors.from_exception(exc)
+        if err is None:
+            raise
+        raise err from exc
+    if result is None:
+        if 200 <= captured.get("status", 0) < 300:
+            return {}
+        raise QQOfficeGatewayError(504, None, "botpy 请求超时或重试耗尽（返回空）")
+    if (isinstance(result, dict) and isinstance(result.get("code"), int)
+            and result["code"] > 0 and result.get("message")):
+        raise qo_errors.from_http_response(400, result)
+    return result if isinstance(result, (dict, list)) else {}
+
+
+def _record_error(state: RobotState, exc: Exception) -> None:
+    state.recent_errors.append(
+        {"ts": time.strftime("%H:%M:%S"), "err": repr(exc)[:200]}
+    )
+
+
+async def _refresh_token(routes: RouteCore, ctx: OperationContext) -> Any:
+    """401/11244 后换 token 并核验代次；返回当前可用的 HTTP。"""
+    http = routes.check_context(ctx)
+    token = getattr(http, "_token", None)
+    if token is not None and hasattr(token, "update_access_token"):
         try:
-            import botpy.http as botpy_http  # 延迟导入，保持 core 零顶层 botpy 依赖
-        except Exception as e:  # pragma: no cover
-            raise QQOfficeNotSupported(f"botpy 不可用，路径 A 失效: {e}")
+            await token.update_access_token()
+        except Exception:
+            pass   # 刷新失败交由下一次请求的 botpy 自动机制兜底
+    return routes.check_context(ctx)
 
-        api = self.bundle.get_api()
-        http = getattr(api, "_http", None)
-        if http is None:
-            raise QQOfficeNotSupported("适配器客户端缺少 _http（botpy BotHttp），无法发起请求")
-        route = botpy_http.Route(method, full_path)
-        # botpy BotHttp.request 内部固定注入 client 级 timeout，透传 timeout 会撞关键字；
-        # 路径 A 的 per-request timeout 不可用，仅路径 B（自建 HTTP）生效
-        kwargs: dict[str, Any] = {}
-        if params:
-            kwargs["params"] = params
-        if payload is not None:
-            kwargs["json"] = payload
-        try:
-            with capture_response_status(botpy_http) as captured:
-                result = await http.request(route, **kwargs)
-        except Exception as exc:  # botpy 抛 RuntimeError 子类
-            err = captured.get("error") or qo_errors.from_exception(exc)
-            if err is None:
-                raise
-            raise err from exc
-        # SDK 对 200/204 空响应和超时都返回 None，必须根据本次请求实际状态区分。
-        if result is None:
-            if 200 <= captured.get("status", 0) < 300:
-                return {}
-            raise QQOfficeGatewayError(504, None, "botpy 请求超时或重试耗尽（返回空）")
-        if isinstance(result, dict) and isinstance(result.get("code"), int) and result["code"] > 0 and result.get("message"):
-            raise qo_errors.from_http_response(400, result)
-        return result if isinstance(result, (dict, list)) else {}
 
-    async def _dispatch_self(self, method: str, full_path: str, params: dict | None,
-                             payload: dict | None, timeout: float) -> dict | list:
-        assert self.self_client is not None
-        status, body, headers = await self.self_client.request(
-            method, full_path, params=params, json=payload, timeout=timeout
-        )
-        # 官方偶发 200 + 错误体（code>0 且带 message）
-        if status < 400 and isinstance(body, dict):
-            code = body.get("code")
-            if isinstance(code, int) and code > 0 and body.get("message"):
-                raise qo_errors.from_http_response(400, body, headers)
-        if status >= 400:
-            err = qo_errors.from_http_response(status, body, headers)
-            if err:
-                raise err
-        return body if isinstance(body, (dict, list)) else {}
+# ---------------- 富消息（上传→发送共用同一上下文） ----------------
 
-    async def _refresh_token(self) -> None:
-        """401/11244 后强制换 token。"""
-        if self.self_client is not None:
-            self.self_client.tokens.invalidate()
-            return
-        try:
-            token = getattr(self.bundle.get_api()._http, "_token", None)
-            if token is not None and hasattr(token, "update_access_token"):
-                await token.update_access_token()
-        except Exception as exc:  # 刷新失败交由下一次请求的 botpy 自动机制兜底
-            self._log("warning", f"token 主动刷新失败（交由 botpy 自动机制）: {exc}")
 
-    async def upload_media(
-        self,
-        scene: str,
-        openid: str,
-        source,
-        file_type: int = 1,
-        srv_send_msg: bool = False,
-    ) -> dict:
-        """上传富媒体，返回含 file_info 的原始响应。
+async def send_rich_bound(svc, bound: BoundSource, *, scene, target_openid,
+                          content, markdown, keyboard, reference, media, file_type,
+                          msg_id, event_id, event_id_source, msg_seq, extra,
+                          on_mutex) -> dict:
+    """富消息入口：入口处固定 OperationContext，上传与发送全程共用。"""
+    routes: RouteCore = svc.routes
+    route, http = routes.resolve(bound)
+    ctx = routes.operation(route)
+    state = routes.state_for(route.robot_key)
 
-        file_type: 1=图片 2=视频 3=语音 4=文件。URL 直传不缓存；
-        file_data 路径按 内容hash:场景:openid:file_type 缓存。
-        """
-        from .media import to_uploadable
+    if scene not in ("group", "c2c", "guild", "dm") or not target_openid:
+        raise QQOfficeNotSupported("send_rich 需要 scene+target_openid（group/c2c/guild/dm）")
 
-        up = to_uploadable(source)
-        prefix = "groups" if scene == "group" else "users"
-        path = f"/v2/{prefix}/{{openid}}/files"
+    if event_id and event_id_source and scene in ("group", "c2c"):
+        from .events import EVENT_ID_SCOPES
 
-        if up.kind == "url":
-            return await self.call(
-                "POST", path,
-                path_params={"openid": openid},
-                json={"file_type": file_type, "url": up.source, "srv_send_msg": srv_send_msg},
-                scene=scene, target_openid=openid,
-                endpoint_key=f"{scene}.files",
+        if event_id_source.upper() not in EVENT_ID_SCOPES.get(scene, set()):
+            svc._log("warning",
+                     f"event_id 事件 {event_id_source} 不在 {scene} 场景官方支持范围，已丢弃")
+            event_id = None
+
+    if markdown and reference and scene in ("group", "c2c"):
+        if on_mutex == "text_reference":
+            md_content = (markdown.get("markdown") or {}).get("content")
+            if md_content and not content:
+                content = md_content
+            markdown = None
+            svc._log("info", "markdown 与 reference 互斥：已降级纯文本并保留引用")
+        else:
+            reference = None
+            svc._log("warning", "markdown 与 reference 互斥：已丢弃 reference")
+
+    payload: dict = dict(extra or {})
+    if scene in ("guild", "dm"):
+        payload.pop("msg_type", None)
+        if media is not None:
+            if file_type != 1 or not isinstance(media, str) or not media.startswith(
+                    ("https://", "http://")):
+                raise QQOfficeNotSupported("频道 send_rich 的 media 支持图片 URL；本地图片请用 AstrBot 原生发送")
+            payload["image"] = media
+    elif media is not None:
+        if not (isinstance(media, dict) and media.get("file_info")):
+            resp = await _upload_shared(
+                svc, ctx, route, state, scene, target_openid, media, file_type,
+                srv_send_msg=False,
             )
+            media = {"file_info": resp.get("file_info")}
+        payload.setdefault("msg_type", 7)
+        payload["media"] = media
+    else:
+        payload.setdefault("msg_type", 2 if markdown else 0)
+    if markdown and content and scene in ("group", "c2c"):
+        svc._log("warning", "markdown 与 content 互斥：已丢弃 content")
+        content = None
+    if content:
+        payload["content"] = content
+    if markdown:
+        payload.update(markdown)
+    if keyboard:
+        payload.update(keyboard)
+    if reference:
+        payload.update(reference)
 
-        data = await up.load_bytes()
+    path, key = {
+        "group": ("/v2/groups/{group_openid}/messages", "group_openid"),
+        "c2c": ("/v2/users/{user_openid}/messages", "user_openid"),
+        "guild": ("/channels/{channel_id}/messages", "channel_id"),
+        "dm": ("/dms/{guild_id}/messages", "guild_id"),
+    }[scene]
+    return await execute_call(
+        svc, bound, "POST", path,
+        path_params={key: target_openid}, json=payload, scene=scene,
+        target_openid=target_openid, msg_id=msg_id, event_id=event_id,
+        msg_seq=msg_seq, _ctx=ctx,
+    )
+
+
+async def upload_media_bound(svc, bound: BoundSource, scene: str, openid: str,
+                             source, file_type: int = 1,
+                             srv_send_msg: bool = False) -> dict:
+    """独立上传入口：与发送同一策略（配额/错误/核验），按需走共同路径。"""
+    routes: RouteCore = svc.routes
+    route, http = routes.resolve(bound)
+    ctx = routes.operation(route)
+    state = routes.state_for(route.robot_key)
+    return await _upload_shared(svc, ctx, route, state, scene, openid, source,
+                                file_type, srv_send_msg)
+
+
+async def _upload_shared(svc, ctx: OperationContext, route, state: RobotState,
+                         scene: str, openid: str, source, file_type: int,
+                         srv_send_msg: bool) -> dict:
+    """上传实现：read/caches→核验→发送；走 execute_call 同一套错误标准化。"""
+    from .media import to_uploadable
+
+    prefix = route.robot_key.prefix()
+    refstore = svc.refstore
+
+    up = to_uploadable(source)
+    chash = None
+    if up.kind != "url":
+        data = await up.load_bytes()   # 读取/剥头在 await 侧完成
+        # 读取媒体是 await：无论后续是否命中缓存，都要核验同一操作上下文
+        # （读取期间实例可能被禁用/重载）。
+        svc.routes.check_context(ctx)
         if scene == "c2c" and file_type == 3:
             from .media import strip_amr_header
 
             data, _ = strip_amr_header(data)
-        chash = self.refstore.content_hash(data)
-        cached = self.refstore.get_file_info(chash, scene, openid, file_type)
+        chash = refstore.content_hash(data)
+        cached = refstore.get_file_info(f"{prefix}|{chash}", scene, openid, file_type)
         if cached and not srv_send_msg:
             return {"file_info": cached, "cached": True}
 
-        resp = await self.call(
-            "POST", path,
-            path_params={"openid": openid},
-            json={
-                "file_type": file_type,
-                "file_data": base64.b64encode(data).decode(),
-                "srv_send_msg": srv_send_msg,
-            },
-            scene=scene, target_openid=openid,
-            endpoint_key=f"{scene}.files",
-        )
-        file_info = str(resp.get("file_info") or "")
-        if file_info:
-            self.refstore.cache_file_info(
-                chash, scene, openid, file_type, file_info, float(resp.get("ttl") or 0)
-            )
-        return resp
-
-    @staticmethod
-    def chunk_text(text: str, limit: int = 1400) -> list[str]:
-        """文本分块（40054007 文本超限）：优先按换行边界切。"""
-        text = text or ""
-        if len(text) <= limit:
-            return [text] if text else []
-        chunks: list[str] = []
-        buf = ""
-        for para in text.split("\n"):
-            while len(para) > limit:
-                if buf:
-                    chunks.append(buf)
-                    buf = ""
-                chunks.append(para[:limit])
-                para = para[limit:]
-            if len(buf) + len(para) + 1 > limit:
-                chunks.append(buf)
-                buf = para
-            else:
-                buf = f"{buf}\n{para}" if buf else para
-        if buf:
-            chunks.append(buf)
-        return chunks
-
-    def status(self) -> dict:
-        return {
-            "mode": self.mode,
-            "appid": self.appid,
-            "calls_total": self.calls_total,
-            "windows": self.windows.stats(),
-            "rate": self.limiter.snapshot(),
-            "refstore": self.refstore.snapshot(),
-            "recent_errors": list(self.recent_errors),
+    path = f"/v2/{'groups' if scene == 'group' else 'users'}/{{openid}}/files"
+    if up.kind == "url":
+        body = {"file_type": file_type, "url": up.source, "srv_send_msg": srv_send_msg}
+    else:
+        body = {
+            "file_type": file_type,
+            "file_data": base64.b64encode(data).decode(),
+            "srv_send_msg": srv_send_msg,
         }
-
-class _SafeDict(dict):
-    """format_map 时未提供的占位符保留原样，交由后续校验报错。"""
-
-    def __missing__(self, key: str) -> str:
-        return "{" + key + "}"
+    resp = await execute_call(
+        svc, None, "POST", path,
+        path_params={"openid": openid}, json=body,
+        scene=scene, target_openid=openid, endpoint_key=f"{scene}.files",
+        _ctx=ctx,
+    )
+    file_info = str(resp.get("file_info") or "")
+    if file_info and up.kind != "url":
+        refstore.cache_file_info(
+            f"{prefix}|{chash}", scene, openid, file_type, file_info,
+            float(resp.get("ttl") or 0),
+        )
+    return resp

@@ -18,6 +18,11 @@ _previous = None
 @contextmanager
 def capture_response_status(http_module):
     global _users, _installed, _previous
+    original = getattr(http_module, "_handle_response", None)
+    if original is None:
+        # 桩模块无 _handle_response（离线测试容错）：不做观察
+        yield {}
+        return
     if _users == 0:
         original = http_module._handle_response
 

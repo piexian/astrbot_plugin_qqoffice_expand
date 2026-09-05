@@ -20,7 +20,7 @@ class GroupAPI(MediaAPI):
     async def send(self, openid: str, content: str, *, msg_id: str | None = None,
                    event_id: str | None = None, msg_seq: int | None = None,
                    extra: dict | None = None) -> dict:
-        """发送群文本消息（msg_type=0）。富消息用 svc.send_rich。"""
+        """发送群文本消息（msg_type=0）。富消息用视图的 send_rich。"""
         body: dict[str, Any] = {"msg_type": 0, "content": content}
         body.update(extra or {})
         return await self._client.call(

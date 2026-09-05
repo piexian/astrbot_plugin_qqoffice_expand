@@ -16,6 +16,11 @@ __all__ = [
     "QQOfficeNotSupported",
     "QQOfficeGatewayError",
     "UploadDailyLimitExceeded",
+    "QQOfficeRoutingError",
+    "InstanceUnavailable",
+    "InstanceIdentityChanged",
+    "StaleSourceEvent",
+    "TransportNotReady",
     "ERROR_ADVICE",
     "from_http_response",
     "from_exception",
@@ -73,8 +78,8 @@ ERROR_ADVICE: dict[int, str] = {
 
 RATE_LIMITED_CODES = frozenset({429, 40034100})
 TOKEN_EXPIRED_CODES = frozenset({11244})
-# 官方 biz 码形态：4003xxxx / 4005xxxx / 4009300x（8 位）、220xx、63000x、11244
-_CODE_RE = _re.compile(r"\b(11244|220\d\d|4003\d{4}|4005\d{4}|4009300[12]|63000\d)\b")
+# 官方 biz 码形态：4003xxxx / 4005xxxx / 4009300x（8 位）、220xx、63000x、11244、11253
+_CODE_RE = _re.compile(r"\b(11244|11253|220\d\d|4003\d{4}|4005\d{4}|4009300[12]|63000\d)\b")
 
 _UPLOAD_DAILY_LIMIT_CODE = 40093002
 
@@ -110,6 +115,31 @@ class QQOfficeGatewayError(QQOfficeError):
         if body_hint:
             text += f"；响应片段：{body_hint}"
         super().__init__(text)
+
+class QQOfficeRoutingError(QQOfficeError):
+    """多实例路由失败基类：请求未进入 SDK 前被拒绝。
+
+    InstanceUnavailable / InstanceIdentityChanged / StaleSourceEvent /
+    TransportNotReady 分别对应实例消失、身份改绑、旧来源、传输未就绪。
+    调用方按类型降级；路由错误不代表官方接口失败，不重试、不换实例重放。
+    """
+
+
+class InstanceUnavailable(QQOfficeRoutingError):
+    """本体索引中已无该配置 ID 的运行实例（禁用/删除/加载中/非 QQ 官方适配器）。"""
+
+
+class InstanceIdentityChanged(QQOfficeRoutingError):
+    """同配置 ID 被改绑到另一机器人（AppID 或环境变化），旧视图不得转给新机器人。"""
+
+
+class StaleSourceEvent(QQOfficeRoutingError):
+    """事件或操作上下文属于旧运行代次（重载/替换前的 client / generation）。"""
+
+
+class TransportNotReady(QQOfficeRoutingError):
+    """当前实例尚无可用的 botpy HTTP（API 未挂载或 token 为 None），不能进入 SDK 请求。"""
+
 
 class UploadDailyLimitExceeded(QQOfficeAPIError):
     """当日上传容量超限（40093002）。"""

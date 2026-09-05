@@ -6,18 +6,19 @@
 
 ## 通用约定
 
-- `svc.call()` 和命名方法保留官方响应对象或数组；成功的空响应统一为 `{}`。不能把数组接口的结果当成字典。
+- `视图.call()`（`svc.instance(id)` / `svc.for_event(event)` 的返回值）和命名方法保留官方响应对象或数组；成功的空响应统一为 `{}`。不能把数组接口的结果当成字典。
 - `extra` 用于补充官方字段；GET 合并进查询参数，写接口合并进 JSON。频道撤回的 `extra` 合并进查询参数；`menu_put` 的 `extra` 沿用原约定合并进 `menu`。
 - 不自动遍历所有分页、不自动拆分批量管理请求，也不把部分失败转换成全成功。调用方决定操作范围并检查返回结果。
-- 所有公开方法自动注册为 `group.*`、`c2c.*`、`guild.*`、`manage.*`，可用 `svc.invoke()` 调用。
-- 方法目录在插件构造时就注册；缺少 QQ 客户端时调用会明确报错。自建 HTTP 兜底通过 AstrBot 的 `Context.get_config()` 读取官方平台配置。
+- 所有公开方法自动注册为 `group.*`、`c2c.*`、`guild.*`、`manage.*`，可在绑定视图上用 `qq.invoke()` 调用。
+- 方法目录只构建一次；调用前以绑定视图（配置实例 ID + 机器人身份 + 运行代次）解析到本体适配器当前的 botpy HTTP，实例缺失/身份改绑/传输未就绪时明确报错（见 README 多实例语义）。自建 HTTP 兜底已移除：请求一律经由本体适配器。
+- 扩展事件视图的自动回复字段：msg_id 取消息 id（含频道消息）；event_id 仅在事件类型属于官方允许集合（GROUP_ADD_ROBOT/GROUP_MSG_RECEIVE/INTERACTION_CREATE/C2C_MSG_RECEIVE/FRIEND_ADD）时推断，并按同一 EVENT_ID_SCOPES 校验；其余事件不伪造 event_id，也不跳过主动消息配额。引用查询按事件来源核验，过期事件不返回新机器人命名空间的引用。
 - 文档明确给出频率的接口使用对应限流。未注明频率的旧频道管理接口使用默认桶，仍由服务端权限和频控规则裁决。
 
 ## 私聊与群聊
 
 | 能力 | 插件入口 | 契约与官方来源 |
 | --- | --- | --- |
-| 普通与富消息 | `c2c.send`、`group.send`、`svc.send_rich` | [C2C](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_messages.post.html)、[群聊](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html)：保留现有封装，支持 Markdown、键盘和引用字段 |
+| 普通与富消息 | `c2c.send`、`group.send`、`qq.send_rich` | [C2C](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_messages.post.html)、[群聊](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html)：保留现有封装，支持 Markdown、键盘和引用字段 |
 | 撤回 | `c2c.recall`、`group.recall` | [单聊撤回](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_messages_message_id.delete.html)、[群聊撤回](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages_message_id.delete.html)：10 QPS，2 分钟内；群管理员可撤普通成员消息 |
 | 输入状态、互动召回 | `c2c.input_notify`、`c2c.wakeup` | 复用单聊发送接口；输入状态最长 60 秒，keepalive 句柄由调用方取消 |
 | 独立流式分片 | `c2c.stream_send` | [stream_messages](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_stream_messages.post.html)：50 QPS，`index` 从 0 递增，结束片 `input_state=10`；首片响应 `id` 用作续片 `stream_msg_id` |
@@ -50,7 +51,7 @@ AstrBot 基线已有 `send_streaming(generator)`，使用 `/messages` 上的旧 
 
 ## 频道管理
 
-以下入口均位于 `svc.guild`；`manage.me` 为机器人全局信息。频道成员使用 `user_id`，与 QQ 群的 `member_openid` 分开。
+以下入口均位于绑定视图的 `qq.guild`；`qq.manage.me()` 为机器人全局信息。频道成员使用 `user_id`，与 QQ 群的 `member_openid` 分开。
 
 | 能力 | 命名方法 | 主要契约与官方来源 |
 | --- | --- | --- |
@@ -70,7 +71,7 @@ AstrBot 基线已有 `send_streaming(generator)`，使用 `/messages` 上的旧 
 | 论坛 | `threads`、`thread_info/create/delete` | [列表](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/channel/content/forum/get_threads_list.html)、[详情](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/channel/content/forum/get_thread.html)、[发表](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/channel/content/forum/put_thread.html)、[删除](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/channel/content/forum/delete_thread.html)：私域；发表使用 PUT，format 1文本/2HTML/3Markdown/4JSON |
 | 接口授权 | `api_permissions`、`api_permission_demand` | [查询](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/channel/api_permissions/get_guild_api_permission.html)、[申请](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/channel/api_permissions/post_api_permission_demand.html)：申请会发送授权链接，默认每频道每天 3 条 |
 
-频道单条消息查询和历史列表本次仅找到[官方 SDK 文档](https://bot.q.qq.com/wiki/develop/pythonsdk/api/message/get_message.html)，没有据此推定当前开放范围或新增历史分页契约，因此未增加专用方法。已具备权限的调用方仍可使用 `svc.call()`。
+频道单条消息查询和历史列表本次仅找到[官方 SDK 文档](https://bot.q.qq.com/wiki/develop/pythonsdk/api/message/get_message.html)，没有据此推定当前开放范围或新增历史分页契约，因此未增加专用方法。已具备权限的调用方仍可使用视图的 `call()`。
 
 ## 机器人菜单、面板与互动
 
@@ -89,15 +90,15 @@ AstrBot 基线已有 `send_streaming(generator)`，使用 `/messages` 上的旧 
 - 新增频道成员、普通频道消息/撤回、私信撤回、论坛、开放论坛、音频和音视频成员事件。频道扩展位按专属订阅者启用，`on_any` 不自动申请全部私域权限；首次订阅后需让 WS 重连或重载适配器，identify 才会携带新位。权限降级不剔除 AstrBot 已有的 1<<12、1<<25、1<<30。
 - 事件位以[官方 Intents 总表](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/event-emit/payload.html)为基线；[开放论坛](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/channel/content/forum/open_forum.html)和[音视频成员事件](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/channel/role/audio_or_live_channel_member.html)另由独立页面与 SDK 核对。
 - `GROUP_JOIN_REQUEST` 的 1<<24/1<<25 标注存在文档版本差异，目前保留既有处理方式；默认群成员事件配置会另外启用 1<<24。
-- 不替换 AstrBot 已有普通消息 handler，不迁移其持久会话格式。频道私信主动发送请明确使用 `guild.dm_send(dm_guild_id, ...)`；`send_rich(event, ...)` 可从当前事件识别频道/私信，避免误走 QQ 群/C2C。
+- 不替换 AstrBot 已有普通消息 handler，不迁移其持久会话格式。频道私信主动发送请明确使用 `guild.dm_send(dm_guild_id, ...)`；`qq.send_rich(...)`（来自 `svc.for_event(event)`）可从当前事件识别频道/私信，避免误走 QQ 群/C2C。
 
 ## 调用示例
 
 ```python
-async def list_group_members(svc, group_openid):
+async def list_group_members(qq, group_openid):
     cursor = ""
     while True:
-        page = await svc.group.members(group_openid, cursor=cursor)
+        page = await qq.group.members(group_openid, cursor=cursor)
         for member in page["members"]:
             yield member
         cursor = page.get("next_cursor", "")
@@ -105,37 +106,42 @@ async def list_group_members(svc, group_openid):
             break
 
 
-async def remove_and_report(svc, group_openid, member_openids):
-    result = await svc.group.remove_members(
+async def remove_and_report(qq, group_openid, member_openids):
+    result = await qq.group.remove_members(
         group_openid, member_openids, add_to_member_blacklist=True
     )
     return result["remove_members_result"], result.get("add_to_member_blacklist_fail_openids", [])
 
 
-async def stream_reply(svc, user_openid, request_msg_id, first_text, remaining_text):
-    first = await svc.c2c.stream_send(user_openid, first_text, msg_id=request_msg_id)
-    return await svc.c2c.stream_send(
+async def stream_reply(qq, user_openid, request_msg_id, first_text, remaining_text):
+    first = await qq.c2c.stream_send(user_openid, first_text, msg_id=request_msg_id)
+    return await qq.c2c.stream_send(
         user_openid, remaining_text, msg_id=request_msg_id,
         stream_msg_id=first["id"], index=1, input_state=10,
     )
 
 
-async def reply_in_guild_dm(svc, dm_guild_id, message_id, content):
-    return await svc.guild.dm_send(dm_guild_id, content, msg_id=message_id)
+async def reply_in_guild_dm(qq, dm_guild_id, message_id, content):
+    return await qq.guild.dm_send(dm_guild_id, content, msg_id=message_id)
 ```
+
+示例中的 `qq = svc.instance(id)` 或 `qq = svc.for_event(event)` 需先绑定；
+根服务 `svc` 只提供构建器、全局订阅、实例查询与状态，不直接调用接口。
 
 ## 验证
 
-在已安装插件依赖的 AstrBot Python 环境中执行：
+在隔离临时环境（bwrap 禁网、代码依赖只读、数据仅 /tmp）中执行，HTTP 均为模拟，
+未连接真实 QQ 机器人接口：
 
 ```sh
 python3 -B tests/offline_test.py
-python3 -B tests/intents_patch_test.py
+python3 -B tests/routing_test.py
 python3 -B tests/api_contract_test.py
+python3 -B tests/intents_patch_test.py
+python3 -B tests/integration_test.py
+python3 -B tests/main_assembly_test.py
 ```
 
-这些是离线契约与生命周期检查，使用模拟 HTTP/网关输入，不代表真实机器人已取得接口权限或完成线上群管理联调。
-
-2026-09-05 另在 Windows Launcher 的 AstrBot `4.28.0-beta.1`、Python `3.12.13`、botpy `1.2.1` 环境完成独立数据目录的真实启动验证：插件加载、96 个方法与诊断指令注册、WebUI 就绪、QQ 适配器构造期 intents 注入、插件热重载、后台任务停止与补丁还原均通过。业务 HTTP 使用模拟响应，未连接真实 QQ 机器人接口。
-
-同日另用实例中已配置的真实机器人完成只读 API 联调：机器人信息、菜单、四种 scope 面板查询、群信息、机器人群内状态、禁言状态、入群申请、审批策略列表均成功。群成员列表、成员详情、黑名单查询返回 `11253`；自建 HTTP 与 botpy 路径一致，测试群中机器人角色为 admin。频道列表返回空数组，未继续验证需要频道目标的管理接口。测试未调用业务写接口；token 的 HTTP 200 成功响应误判为错误的问题已修正并补充缓存回归。
+以上为本次 N 实例版本的离线契约/路由/生命周期/真实 Main 装配检查；模拟 HTTP
+不代表真实机器人已取得接口权限，未执行线上群管理联调（无凭据，见
+README 顶部边界说明）。
