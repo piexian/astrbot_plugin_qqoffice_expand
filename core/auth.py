@@ -42,7 +42,7 @@ def find_qq_credentials(context: Any) -> list[dict]:
     """
     out: list[dict] = []
     try:
-        platforms = (getattr(context, "config", None) or {}).get("platform") or []
+        platforms = context.get_config().get("platform") or []
     except Exception:
         platforms = []
     for p in platforms:

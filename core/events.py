@@ -11,23 +11,25 @@ patch 收敛在 botpy client/ConnectionState 一层（websocket 与 webhook 的�
   写入待连会话，活跃会话需重载一次适配器。网关 4013/4014 拒断时自动剔除
   扩展位降级，保住基础连接，权限开通并重载后恢复。群成员 1<<24 在 botpy
   Intents 无标志位，只能 client.intents |= bit，合并而非覆盖。
-② parsers：botpy 1.2.1 缺 group_member_add/remove/join_request——类级
-  setattr（webhook 每次回调懒建新 ConnectionState 实例，只有类级能被自动
-  注册）+ 运行中 ws 实例的 state.parsers 直补。
+② parsers：补 botpy 1.2.1 缺失的群成员 parser，同时包装已有 WS/Webhook
+  state 的扩展事件 parser，保留 SDK 模型没有承载的原始字段。
 ③ client.on_xxx：ws_dispatch 是动态 getattr，setattr 即注册。
 
-INTERACTION_CREATE 先自动 PUT /interactions/{id} code=0（3 秒时限、同 id
-一次）再分发，interaction_auto_ack 可关。
+INTERACTION_CREATE 的 type=11/12 自动 PUT /interactions/{id} code=0（3 秒
+时限、同 id 一次），其他互动类型无需应答；interaction_auto_ack 可关。
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .auth import QQClientBundle, find_qq_clients
+
+_RAW_EVENT: ContextVar[tuple[str, dict] | None] = ContextVar("qqoffice_raw_event", default=None)
 
 __all__ = ["QQOfficeEvent", "EventBus", "AdapterPatcher", "EVENT_SPECS", "INTENT_BITS"]
 
@@ -66,10 +68,35 @@ EVENT_SPECS: dict[str, EventSpec] = {
     "CHANNEL_CREATE":    EventSpec("CHANNEL_CREATE", 1 << 0, False, "guild_p2", "guild"),
     "CHANNEL_UPDATE":    EventSpec("CHANNEL_UPDATE", 1 << 0, False, "guild_p2", "guild"),
     "CHANNEL_DELETE":    EventSpec("CHANNEL_DELETE", 1 << 0, False, "guild_p2", "guild"),
+    "GUILD_MEMBER_ADD":    EventSpec("GUILD_MEMBER_ADD", 1 << 1, False, "guild_p2", "guild"),
+    "GUILD_MEMBER_UPDATE": EventSpec("GUILD_MEMBER_UPDATE", 1 << 1, False, "guild_p2", "guild"),
+    "GUILD_MEMBER_REMOVE": EventSpec("GUILD_MEMBER_REMOVE", 1 << 1, False, "guild_p2", "guild"),
+    "MESSAGE_CREATE": EventSpec("MESSAGE_CREATE", 1 << 9, False, "guild_p2", "guild"),
+    "MESSAGE_DELETE": EventSpec("MESSAGE_DELETE", 1 << 9, False, "guild_p2", "guild"),
+    # 基础适配器已订阅 1<<12/1<<30，不能将这些位加入扩展位降级掩码。
+    "DIRECT_MESSAGE_DELETE": EventSpec("DIRECT_MESSAGE_DELETE", None, False, "guild_p2", "dm"),
+    "PUBLIC_MESSAGE_DELETE": EventSpec("PUBLIC_MESSAGE_DELETE", None, False, "guild_p2", "guild"),
 }
 
+for _bit, _names in (
+    (28, ("FORUM_THREAD_CREATE", "FORUM_THREAD_UPDATE", "FORUM_THREAD_DELETE",
+          "FORUM_POST_CREATE", "FORUM_POST_DELETE", "FORUM_REPLY_CREATE",
+          "FORUM_REPLY_DELETE", "FORUM_PUBLISH_AUDIT_RESULT")),
+    (29, ("AUDIO_START", "AUDIO_FINISH", "AUDIO_ON_MIC", "AUDIO_OFF_MIC")),
+    (19, ("AUDIO_OR_LIVE_CHANNEL_MEMBER_ENTER", "AUDIO_OR_LIVE_CHANNEL_MEMBER_EXIT")),
+    (18, ("OPEN_FORUM_THREAD_CREATE", "OPEN_FORUM_THREAD_UPDATE", "OPEN_FORUM_THREAD_DELETE",
+          "OPEN_FORUM_POST_CREATE", "OPEN_FORUM_POST_DELETE", "OPEN_FORUM_REPLY_CREATE", "OPEN_FORUM_REPLY_DELETE")),
+):
+    for _name in _names:
+        # SDK 1.2.1 的 parse_on_mic/off_mic 名称缺少 audio_ 前缀。
+        EVENT_SPECS[_name] = EventSpec(_name, 1 << _bit, _name in ("AUDIO_ON_MIC", "AUDIO_OFF_MIC"), "guild_p2", "guild")
+del _bit, _names, _name
+
 INTENT_BITS = {"interaction": 1 << 26, "message_audit": 1 << 27, "guild_member": 1 << 24,
-               "guild_message_reactions": 1 << 10, "guilds": 1 << 0}
+               "group_member": 1 << 24, "guild_members": 1 << 1,
+               "guild_message_reactions": 1 << 10, "guilds": 1 << 0,
+               "guild_messages": 1 << 9, "forums": 1 << 28, "audio_action": 1 << 29,
+               "open_forum_event": 1 << 18, "audio_or_live_channel_member": 1 << 19}
 
 # 插件可能追加的全部 intents 位（与 AstrBot 基础位 1<<30/1<<25/1<<12 无交集，
 # 4013/4014 拒断时整体剔除不会误伤基础订阅）
@@ -117,6 +144,8 @@ class QQOfficeEvent:
     channel_id: str | None = None
     interaction_id: str | None = None
     timestamp: str | None = None
+    user_id: str | None = None     # 频道用户 ID，与 QQ member_openid 分开
+    message_id: str | None = None
     received_at: float = field(default_factory=time.time)
     obj: Any = None               # 原始 botpy 包装对象（想摸原始字段时用）
 
@@ -163,6 +192,11 @@ def normalize_event(event_name: str, obj: Any) -> QQOfficeEvent:
             if data_type is not None:
                 raw["data"]["type"] = data_type
         raw = {k: v for k, v in raw.items() if v is not None}
+        for key in ("type", "scene", "timestamp", "member_openid", "group_member_openid",
+                    "user_id", "message_id", "audit_id", "emoji", "target", "user"):
+            value = _field(obj, key)
+            if value is not None:
+                raw[key] = value
 
     scene = None
     group_openid = raw.get("group_openid") or _field(obj, "group_openid")
@@ -172,17 +206,25 @@ def normalize_event(event_name: str, obj: Any) -> QQOfficeEvent:
         or _field(obj, "user_openid") or _field(obj, "openid")
     )
     member_openid = (
-        raw.get("group_member_openid")
+        raw.get("member_openid")
+        or raw.get("group_member_openid")
         or raw.get("op_member_openid")
         or _field(obj, "op_member_openid")
     )
-    author = raw.get("author") or _field(obj, "author")
+    deleted_message = raw.get("message") if "MESSAGE_DELETE" in upper else None
+    author = raw.get("author") or _field(deleted_message, "author") or _field(obj, "author")
+    guild_id = raw.get("guild_id") or _field(deleted_message, "guild_id") or _field(obj, "guild_id")
+    channel_id = raw.get("channel_id") or _field(deleted_message, "channel_id") or _field(obj, "channel_id")
+    if upper in ("GUILD_CREATE", "GUILD_UPDATE", "GUILD_DELETE"):
+        guild_id = guild_id or raw.get("id")
+    if upper in ("CHANNEL_CREATE", "CHANNEL_UPDATE", "CHANNEL_DELETE"):
+        channel_id = channel_id or raw.get("id")
     if group_openid:
         scene = "group"
     elif user_openid:
         scene = "c2c"
-    elif raw.get("guild_id") or _field(obj, "guild_id"):
-        scene = "guild"
+    elif guild_id or channel_id:
+        scene = "dm" if upper.startswith("DIRECT_MESSAGE_") else "guild"
 
     interaction_id = raw.get("id") if upper == "INTERACTION_CREATE" else None
     return QQOfficeEvent(
@@ -200,10 +242,13 @@ def normalize_event(event_name: str, obj: Any) -> QQOfficeEvent:
         user_openid=user_openid or _field(author, "user_openid") if author else user_openid,
         group_openid=group_openid,
         member_openid=member_openid or _field(author, "member_openid") if author else member_openid,
-        guild_id=raw.get("guild_id") or _field(obj, "guild_id"),
-        channel_id=raw.get("channel_id") or _field(obj, "channel_id"),
+        guild_id=guild_id,
+        channel_id=channel_id,
         interaction_id=interaction_id,
         timestamp=raw.get("timestamp"),
+        user_id=raw.get("user_id") or _field(raw.get("user"), "id") or _field(author, "id"),
+        message_id=raw.get("message_id") or _field(deleted_message, "id") or _field(raw.get("target"), "id")
+        or (raw.get("id") if "MESSAGE_DELETE" in upper or upper == "MESSAGE_CREATE" else None),
         obj=obj,
     )
 
@@ -285,6 +330,9 @@ class EventBus:
                 self.logger.error(f"[qqoffice_expand] 事件处理器异常 ({ev.type}): {exc!r}")
 
     def _auto_ack(self, ev: QQOfficeEvent) -> None:
+        interaction_type = ev.raw.get("type") or _field(ev.raw.get("data"), "type")
+        if interaction_type not in (11, 12):
+            return  # 反馈、授权等互动不需要应答
         iid = ev.interaction_id or (ev.raw or {}).get("id")
         if not iid:
             return
@@ -465,13 +513,14 @@ class AdapterPatcher:
         client = bundle.client
         record = self._patched.get(id(client))
         if record is None:
-            record = {"bundle": bundle, "on_added": [], "parser_keys": [],
+            record = {"bundle": bundle, "on_added": [], "on_handlers": {},
+                      "parser_keys": [], "parser_patches": [],
                       "intents_applied": [], "original_intents": None,
                       "verdict": None}   # None | "ok" | ("missing", bits)，状态变化才重复记录日志
             self._patched[id(client)] = record
 
         self._patch_parsers_class()
-        self._patch_parsers_instance(client, record)
+        self._patch_parsers_instance(bundle, record)
         self._apply_intents(bundle, record, [
             spec for spec in EVENT_SPECS.values()
             if self._intent_enabled(spec)
@@ -484,14 +533,13 @@ class AdapterPatcher:
             return False
         if spec.intent == 1 << 24:
             return bool(self.config.get("enable_group_member_events", True))
-        if spec.intent in (1 << 10, 1 << 0):
-            # P2 频道组：有订阅者才置位
+        if spec.group == "guild_p2":
+            # 频道扩展权限按需订阅，避免默认申请私域/音频权限。
             return bool(self.bus._subs.get(spec.name))
         return True  # interaction 1<<26 / audit 1<<27 默认置位
 
     def _patch_parsers_class(self) -> None:
-        """类级补 parser：webhook 模式每次回调懒建新 ConnectionState 实例，
-        只有类级 setattr 能被其 inspect.getmembers 自动注册。"""
+        """为之后创建的 ConnectionState 补 SDK 缺失的 parser。"""
         try:
             from botpy.connection import ConnectionState
         except Exception:
@@ -505,32 +553,57 @@ class AdapterPatcher:
             name = spec.name.lower()
 
             def _parse(self_state, payload, _name=name):  # noqa: N805
-                self_state._dispatch(_name, payload.get("d", {}))
+                self_state._dispatch(_name, payload)
 
+            _parse._qqoffice_owner = self
             setattr(ConnectionState, attr, _parse)
             self._class_parser_names.add(name)
 
-    def _patch_parsers_instance(self, client, record: dict) -> None:
-        """运行中的 ws 客户端：实例 state.parsers 直补（类级对已有实例无效）。"""
-        state = self._get_state(client)
-        if state is None:
-            return
-        parsers = getattr(state, "parsers", None)
-        if not isinstance(parsers, dict):
-            return
-        for spec in EVENT_SPECS.values():
-            if not spec.needs_parser:
+    def _patch_parsers_instance(self, bundle: QQClientBundle, record: dict) -> None:
+        """覆盖已存在的 WS/Webhook state，并在原 SDK parser 上保留完整 payload。"""
+        for state in self._get_states(bundle):
+            parsers = getattr(state, "parsers", None)
+            if not isinstance(parsers, dict):
                 continue
-            key = spec.name.lower()
-            if key in parsers:
-                continue
+            for spec in EVENT_SPECS.values():
+                key = spec.name.lower()
+                original = parsers.get(key)
+                if any(s is state and k == key and original is wrapper
+                       for s, k, _, wrapper in record["parser_patches"]):
+                    continue
+                if original is None and not spec.needs_parser:
+                    continue
 
-            def _parse(payload, _state=state, _key=key):
-                _state._dispatch(_key, payload.get("d", {}))
+                def _parse(payload, _state=state, _key=key, _original=original):
+                    # botpy 在同步 parser 内 create_task；handler 任务会继承此上下文。
+                    token = _RAW_EVENT.set((_key, payload))
+                    try:
+                        if _original is not None:
+                            return _original(payload)
+                        return _state._dispatch(_key, payload)
+                    finally:
+                        _RAW_EVENT.reset(token)
 
-            parsers[key] = _parse
-            if key not in record["parser_keys"]:
-                record["parser_keys"].append(key)
+                parsers[key] = _parse
+                # 新 state 自动收集的类级补丁也归本插件所有，卸载时应移除。
+                func = getattr(original, "__func__", original)
+                restore = None if getattr(func, "_qqoffice_owner", None) is self else original
+                record["parser_patches"].append((state, key, restore, _parse))
+                if key not in record["parser_keys"]:
+                    record["parser_keys"].append(key)
+
+    @classmethod
+    def _get_states(cls, bundle: QQClientBundle) -> list:
+        states = []
+        state = cls._get_state(bundle.client)
+        if state is not None:
+            states.append(state)
+        helper = getattr(getattr(bundle, "inst", None), "webhook_helper", None)
+        connection = getattr(helper, "_connection", None)
+        state = getattr(connection, "state", None)
+        if state is not None and all(state is not current for current in states):
+            states.append(state)
+        return states
 
     @staticmethod
     def _get_state(client) -> Any:
@@ -654,14 +727,18 @@ class AdapterPatcher:
             handler = self._make_handler(spec)
             setattr(client, attr, handler)
             record["on_added"].append(attr)
+            record["on_handlers"][attr] = handler
 
     def _make_handler(self, spec: EventSpec):
         bus = self.bus
 
         async def _handler(*args):
             obj = args[0] if args else None
-            ev = normalize_event(spec.name.lower(), obj)
-            if spec.scene in ("group", "c2c") and ev.scene is None:
+            captured = _RAW_EVENT.get()
+            payload = captured[1] if captured and captured[0] == spec.name.lower() else obj
+            ev = normalize_event(spec.name.lower(), payload)
+            ev.obj = obj
+            if spec.scene in ("group", "c2c", "guild", "dm") and ev.scene is None:
                 ev.scene = spec.scene
             # 入站 msg_idx 入库（recorder 由 main 注入）
             if self._inbound_recorder is not None:
@@ -684,14 +761,16 @@ class AdapterPatcher:
             client = record["bundle"].client
             for attr in record["on_added"]:
                 try:
-                    delattr(client, attr)
+                    if getattr(client, attr, None) is record["on_handlers"][attr]:
+                        delattr(client, attr)
                 except AttributeError:
                     pass
-            state = self._get_state(client)
-            parsers = getattr(state, "parsers", None) if state is not None else None
-            if isinstance(parsers, dict):
-                for key in record["parser_keys"]:
-                    parsers.pop(key, None)
+            for state, key, original, wrapper in reversed(record["parser_patches"]):
+                if state.parsers.get(key) is wrapper:
+                    if original is None:
+                        state.parsers.pop(key, None)
+                    else:
+                        state.parsers[key] = original
             if record["original_intents"] is not None:
                 try:
                     client.intents = record["original_intents"]
@@ -703,7 +782,9 @@ class AdapterPatcher:
 
                 for name in self._class_parser_names:
                     try:
-                        delattr(ConnectionState, f"parse_{name}")
+                        attr = f"parse_{name}"
+                        if getattr(getattr(ConnectionState, attr, None), "_qqoffice_owner", None) is self:
+                            delattr(ConnectionState, attr)
                     except AttributeError:
                         pass
             except Exception:
@@ -720,7 +801,7 @@ class AdapterPatcher:
                 "instance_id": bundle.instance_id,
                 "adapter": bundle.name,
                 "mode": bundle.mode,
-                "connected": self._looks_connected(bundle.client),
+                "connected": self._looks_connected(bundle.client) if bundle.mode == "ws" else bool(self._get_states(bundle)),
                 "on_mounted": len(record["on_added"]),
                 "instance_parsers_added": record["parser_keys"],
                 "intents_applied": [hex(b) for b in record["intents_applied"]],

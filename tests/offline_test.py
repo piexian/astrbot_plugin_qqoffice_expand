@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """离线逻辑自测：core/api 模块零 astrbot 依赖，全部可导入直测。"""
 import asyncio
-from pathlib import Path
 import base64
 import struct
 import sys
 import tempfile
+from unittest.mock import patch
 from pathlib import Path
 
-sys.path.insert(0, r"D:\GitHub\astrbot_plugin_qqoffice_expand")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core import builders, errors, media
 from core.auth import QQClientBundle, SelfClient, TokenManager, resolve_domain, find_qq_credentials
@@ -139,7 +139,8 @@ async def rl_test():
 asyncio.run(rl_test())
 
 # ---------- media ----------
-up = media.to_uploadable("https://example.com/a.png")
+with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 443))]):
+    up = media.to_uploadable("https://example.com/a.png")
 t("up url", up.kind == "url" and up.filename == "a.png")
 up2 = media.to_uploadable(base64.b64encode(b"hello world payload 0123456789abcdefghij" * 3).decode())
 t("up b64", up2.kind == "base64")
@@ -167,7 +168,7 @@ reg = Registry()
 ns = ManageAPI(None)
 for name, fn in collect_methods(ns).items():
     reg.register_fn(f"manage.{name}", fn)
-t("registry count", len(reg.names()) == 9 and "manage.interaction_ack" in reg.names())
+t("registry count", len(reg.names()) == 10 and "manage.interaction_ack" in reg.names() and "manage.me" in reg.names())
 async def _reg_unknown():
     try:
         await reg.invoke("manage.nope")
@@ -277,7 +278,7 @@ async def bus_test():
     async def fake_ack(iid):
         acked.append(iid)
     bus.set_ack_caller(fake_ack)
-    ev = normalize_event("interaction_create", {"d": {"id": "I-1", "user_openid": "U"}})
+    ev = normalize_event("interaction_create", {"d": {"id": "I-1", "type": 11, "user_openid": "U"}})
     await bus.emit(ev)
     await bus.emit(ev)  # 同 id 第二次：不应重复 ack，但事件仍分发
     await asyncio.sleep(0.05)

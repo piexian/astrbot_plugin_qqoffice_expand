@@ -49,6 +49,7 @@ def btn(label: str, data: str, *, type: int = 2, permission_type: int = 2,
         visited_label: str | None = None, style: int | None = None,
         enter: bool | None = None, reply: bool | None = None, anchor: int | None = None,
         unsupport_tips: str | None = None, button_id: str | None = None,
+        modal: dict | None = None,
         **extra) -> dict:
     """构建单按钮 dict（官方 Button 结构）。
 
@@ -66,7 +67,7 @@ def btn(label: str, data: str, *, type: int = 2, permission_type: int = 2,
         permission["specify_role_ids"] = specify_role_ids
     action["permission"] = permission
     for k, v in (("enter", enter), ("reply", reply), ("anchor", anchor),
-                 ("unsupport_tips", unsupport_tips)):
+                 ("unsupport_tips", unsupport_tips), ("modal", modal)):
         if v is not None:
             action[k] = v
     button: dict[str, Any] = dict(extra)

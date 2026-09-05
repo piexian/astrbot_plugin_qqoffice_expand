@@ -1,6 +1,6 @@
 # QQ 官方机器人能力扩展 (astrbot_plugin_qqoffice_expand)
 
-把 QQ 官方开放平台在 AstrBot 本体（`qq_official` / `qq_official_webhook` 适配器）中缺失的能力封装成稳定接口，供**其他插件**调用，避免各自裸调 `event.bot.api`、重复处理鉴权/频控/错误码。
+通过可卸载的猴子补丁和统一调用入口，补充 AstrBot（`qq_official` / `qq_official_webhook`）的扩展事件与官方 API 能力，供**其他插件**调用。普通消息收发继续由 AstrBot 负责；已有 SDK 能力统一纳入鉴权、频控和错误处理。
 
 > ⚠️ **WebUI 热安装/更新本插件后，请在管理面板重载一次 QQ 官方平台适配器（或重启 AstrBot）。**
 > intents 位只能随 ws identify 下发。插件会类级包装适配器构造函数，在实例化时注入扩展位——此后每次启动/重载都自动携带；但热安装那一刻已在会话中的适配器无法补发 identify，需重载一次适配器，永久生效。若扩展位未在 QQ 开放平台开通权限导致 identify 被网关 4013/4014 拒断，插件会自动剔除扩展位保住基础连接并日志提示，开通权限后重载插件与适配器即可恢复。
@@ -18,11 +18,14 @@ __平台支持__: 仅 QQ 官方机器人适配器（`qq_official` websocket 模�
 
 ## 功能
 
-- 群管理命名方法 - 撤回、成员禁言（≤10 人/次、≤30 天）、入群审批（通过/拒绝/拉黑）、自动审批策略 6 件套、群信息与机器人状态
-- 单聊命名方法 - 撤回、全参数发送、输入中状态（`input_second` ≤60s，keepalive 每 50s 自动续发）、互动召回（30 天 4 周期）、富媒体上传（语音自动剥 AMR 头）
+- 群管理命名方法 - 成员列表与详情、批量移除、群黑名单、撤回、禁言、入群审批、自动审批策略 6 件套、群信息与机器人状态
+- 单聊命名方法 - 独立流式分片、撤回、全参数发送、输入中状态（`input_second` ≤60s，keepalive 每 50s 自动续发）、互动召回、富媒体上传
+- 分片上传控制 - 群聊/C2C 的预上传、分片确认和合并接口；可复用 AstrBot 原有的完整上传流程
+- 频道管理 - 频道与子频道、成员、身份组、权限、禁言、消息与私信、公告、精华、日程、表情表态、音频、论坛和接口授权
+- [接口覆盖与调用示例](docs/API_COVERAGE.md) - 官方来源、分页、部分失败、权限边界，以及与 AstrBot 现有能力的分工
 - `send_rich` 富消息 - markdown + 按钮键盘 + 引用回复，绕开本体消息序列化对 keyboard/reference 的丢弃；markdown × reference 互斥内建裁决
 - 通用 `call()` 通道 - **任意官方端点当天可用**：频控令牌桶、主动消息配额、无状态 msg_seq、被动窗口自动降级、token/频控自动重试、HTML 网关页识别、错误码 → 排查建议
-- 扩展事件订阅 - 按钮回调（3 秒时限自动应答、同 id 一次）、群管理 8 事件、入群申请、群成员进出、审核事件、频道事件；未登记事件走 `on_any` 透传
+- 扩展事件订阅 - 按钮和快捷菜单（type=11/12，3 秒时限自动应答、同 id 一次）、群管理、入群申请、群成员进出、审核、频道成员与撤回、论坛、音频等；完整原始 payload 保留在 `ev.raw`
 - REFIDX 引用索引 - 入站 msg_idx / 出站 ref_idx 本地持久化（JSONL + 7 天 TTL + LRU 5 万条），发送引用回复的前置依赖
 - 诊断指令 `/qqoffice_status` - 适配器发现/挂载/intents/订阅/频控状态一览
 
@@ -41,13 +44,13 @@ __平台支持__: 仅 QQ 官方机器人适配器（`qq_official` websocket 模�
 | --- | --- | --- | --- |
 | `prefer_new_domain` | bool | false | 使用统一域名 `api.bot.qq.com`（会同步改写 botpy Route 域名，影响该适配器全部请求）；旧域名 `api.sgroup.qq.com` 当前仍可用，官方下线旧域名时再开启 |
 | `sandbox` | bool | false | 使用沙箱域名 `sandbox.api.sgroup.qq.com`，仅联调测试时开启 |
-| `certified_bot` | bool | false | 机器人是否为认证主体，影响主动消息每分钟配额档位（认证 60 条/分钟，未认证 30 条/分钟） |
+| `certified_bot` | bool | false | 群聊认证 60/分钟、未认证 30/分钟；C2C 认证 10/秒、未认证 5/秒且 30/分钟，两种场景分别计数 |
 | `auto_degrade_proactive` | bool | true | 被动回复窗口（群 5 分钟/5 次、C2C 60 分钟/4 次）超窗/超次时自动降级为主动消息；关闭后直接抛错 |
 | `dot_replace` | bool | false | 群聊文本中把「字母/汉字.字母/汉字」替换为下划线，规避平台 40054010「不允许发送URL」误拦；默认关闭（会改变文本语义） |
-| `interaction_auto_ack` | bool | true | 收到 INTERACTION_CREATE 后先自动 `PUT /interactions/{id}` code=0（3 秒时限）再分发给订阅者 |
+| `interaction_auto_ack` | bool | true | 仅对按钮和快捷菜单（type=11/12）自动应答；反馈、授权等其他互动完整分发，由调用方按需处理 |
 | `enable_group_member_events` | bool | true | 订阅群成员进出事件（intent 1<<24）；修改后需重载 QQ 官方平台适配器才生效 |
 | `ref_ttl_days` | int | 7 | 引用索引（msg_idx / ref_idx）本地留存天数；0 表示不落盘（仅内存） |
-| `retry_max` | int | 3 | 命中频控（429/40034100/40034101）时的自动等待重试次数上限；401/11244 的 token 重试固定 1 次 |
+| `retry_max` | int | 3 | 命中频控（429/40034100，以及流式接口的 50002）时的自动等待重试次数上限；401/11244 的 token 重试固定 1 次 |
 
 ## 使用
 
@@ -100,7 +103,7 @@ class MyPlugin(Star):
         ...
 ```
 
-约定：返回值统一为官方原始响应 dict；错误统一抛 `QQOfficeAPIError(code, message, advice)`（`QQOfficeNotSupported` 表示当前场景不支持，调用方据此降级）。也可在后台任务里轮询（`await svc.wait_ready(timeout)` / `svc.ready`），但不建议在 initialize 里轮询。
+约定：返回值保留官方原始 dict 或 list，成功空响应为 `{}`；错误统一抛 `QQOfficeAPIError(code, message, advice)`（`QQOfficeNotSupported` 表示当前场景不支持，调用方据此降级）。也可在后台任务里轮询（`await svc.wait_ready(timeout)` / `svc.ready`），但不建议在 initialize 里轮询。
 
 ### 通用通道（官方上新接口当天可用）
 
@@ -130,6 +133,8 @@ await svc.send_rich(
 await svc.send_rich(event, content="收到", reference=svc.reference(svc.ref_from_event(event)))
 ```
 
+`send_rich` 能从当前事件区分 QQ 群、C2C、频道文字子频道和频道私信；也支持显式 `scene="guild"`（target_openid 为 channel_id）或 `scene="dm"`（target_openid 为私信 guild_id）。频道媒体参数支持图片 URL，本地图片发送可继续使用 AstrBot 原生能力。
+
 ### 诊断指令
 
 ```
@@ -142,7 +147,9 @@ await svc.send_rich(event, content="收到", reference=svc.reference(svc.ref_fro
 2. **扩展 intents 位（群成员 1<<24 / 互动 1<<26 / 审核 1<<27）仅随 ws identify 下发**：构造期注入保证启动与重载适配器时自动携带；运行中修改相关配置后重载一次适配器生效。`qqoffice_status` 的 `session_verdicts` 显示当前会话 identify 载荷实况（`ok` 即已携带）。
 3. 插件加载顺序不可调：依赖方按「使用」小节的绑定模板接入，本插件 initialize 成功时框架广播且 `svc.ready` 已置位，两种加载顺序都能自动接上。注意：该方案解决的是"拿不到 svc"，不改变热安装后需重载一次适配器的 intents 时序（见顶部警告）。
 4. `on_any` 覆盖的是**已挂载**事件类型；官方全新事件在网关层会被 botpy 丢弃，需按 EVENT_SPECS 补一行（设计上的兜底边界）。
-5. 大文件分片上传不复用本插件：AstrBot 自带 `qqofficial_chunked_upload.py` 已处理 40093001 持续重试与 prepare 字符串字段转换，本插件只提供 ≤单请求的 `upload_media`。
+5. AstrBot 自带完整分片上传流程；本插件另提供 `upload_prepare/upload_part_finish/upload_complete` 控制接口。预签名 PUT 与上传调度由调用方负责，详见接口覆盖文档。
+6. 新增频道扩展位按专属订阅者启用，`on_any` 不会自动申请全部权限。首次订阅后重连或重载适配器，WS identify 才会携带新位；Webhook 同时受开放平台后台订阅设置约束。
+7. `c2c.stream_send` 提供新 `/stream_messages` 分片协议，保留 AstrBot 已有流式实现。首片被动窗口失效时会报错，不静默切换整条流的回复模式。
 
 ## 实测联调清单
 

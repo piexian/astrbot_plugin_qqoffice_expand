@@ -7,10 +7,13 @@ openid 均为群 OpenID；message_id 为群消息 ID。
 from __future__ import annotations
 
 from typing import Any
+from .media import MediaAPI
 
 __all__ = ["GroupAPI"]
 
-class GroupAPI:
+class GroupAPI(MediaAPI):
+    _scene = "group"
+
     def __init__(self, client):
         self._client = client
 
@@ -84,6 +87,67 @@ class GroupAPI:
         return await self._client.call(
             "GET", "/v2/groups/{group_openid}/restrict_chat_setting",
             path_params={"group_openid": openid}, params=extra,
+            scene="group", target_openid=openid,
+        )
+
+    async def members(self, openid: str, *, cursor: str = "",
+                      extra: dict | None = None) -> dict:
+        """群成员列表（内邀，60 QPM）。每页最多 30 人，next_cursor 为空时结束。"""
+        params: dict[str, Any] = dict(extra or {})
+        if cursor:
+            params["cursor"] = cursor
+        return await self._client.call(
+            "GET", "/v2/groups/{group_openid}/members",
+            path_params={"group_openid": openid}, params=params or None,
+            scene="group", target_openid=openid,
+        )
+
+    async def member_info(self, openid: str, member_openid: str, *,
+                          extra: dict | None = None) -> dict:
+        """指定群成员信息（内邀，30 QPM），含 member_role、username、joined_at。"""
+        return await self._client.call(
+            "GET", "/v2/groups/{group_openid}/members/{member_openid}",
+            path_params={"group_openid": openid, "member_openid": member_openid},
+            params=extra, scene="group", target_openid=openid,
+        )
+
+    async def remove_members(self, openid: str, member_openids: list[str], *,
+                             add_to_member_blacklist: bool = False,
+                             extra: dict | None = None) -> dict:
+        """批量移除（内邀，30 QPM，≤20 人）。移除成功仍可能有拉黑失败名单。"""
+        body = {"member_openids": member_openids,
+                "add_to_member_blacklist": add_to_member_blacklist}
+        body.update(extra or {})
+        return await self._client.call(
+            "POST", "/v2/groups/{group_openid}/batch_remove_members",
+            path_params={"group_openid": openid}, json=body,
+            scene="group", target_openid=openid,
+        )
+
+    async def blacklist(self, openid: str, *, cursor: str = "", limit: int | None = None,
+                        extra: dict | None = None) -> dict:
+        """群黑名单（内邀，30 QPM）。limit 默认 20、最大 100，返回 users/next_cursor。"""
+        params: dict[str, Any] = dict(extra or {})
+        if cursor:
+            params["cursor"] = cursor
+        if limit is not None:
+            params["limit"] = limit
+        return await self._client.call(
+            "GET", "/v2/groups/{group_openid}/member_blacklist",
+            path_params={"group_openid": openid}, params=params or None,
+            scene="group", target_openid=openid,
+        )
+
+    async def set_blacklist(self, openid: str, op: str, member_openids: list[str], *,
+                            extra: dict | None = None) -> dict:
+        """增删黑名单（内邀，60 QPM）：add/del，≤20 人；add 的目标须已不在群中。
+        返回 fail_openids，调用方应检查部分失败。
+        """
+        body = {"op": op, "member_openids": member_openids}
+        body.update(extra or {})
+        return await self._client.call(
+            "POST", "/v2/groups/{group_openid}/member_blacklist",
+            path_params={"group_openid": openid}, json=body,
             scene="group", target_openid=openid,
         )
 

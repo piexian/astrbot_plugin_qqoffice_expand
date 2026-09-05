@@ -14,7 +14,7 @@
   "certified_bot": {
     "type": "bool",
     "description": "认证主体机器人",
-    "hint": "影响主动消息频控档位：认证 60 条/分钟，未认证 30 条/分钟",
+    "hint": "群聊认证 60/分钟、未认证 30/分钟；C2C 认证 10/秒、未认证 5/秒且 30/分钟",
     "default": false
   },
   "auto_degrade_proactive": {
@@ -32,7 +32,7 @@
   "interaction_auto_ack": {
     "type": "bool",
     "description": "互动事件自动应答",
-    "hint": "3 秒时限内自动 code=0 应答；需自定义应答内容时关闭",
+    "hint": "仅按钮和快捷菜单（type=11/12）在 3 秒内自动 code=0 应答；需自定义应答内容时关闭",
     "default": true
   },
   "enable_group_member_events": {

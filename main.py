@@ -44,7 +44,7 @@ class _UnavailableClient:
 
     mode = "none"
 
-    async def call(self, *args, **kwargs) -> dict:
+    async def call(self, *args, **kwargs) -> dict | list:
         raise QQOfficeNotSupported(
             "未发现 QQ 官方平台适配器（qq_official / qq_official_webhook），"
             "且全局配置中无可用 appid/secret（路径 B 不可用）"
@@ -72,10 +72,7 @@ class Main(Star):
         self.self_clients: list[QQOfficeClient] = []      # 自建 HTTP（路径 B）
         self.primary: QQOfficeClient | _UnavailableClient = _UnavailableClient()
 
-        self.group = GroupAPI(self.primary)
-        self.c2c = C2CAPI(self.primary)
-        self.guild = GuildAPI(self.primary)
-        self.manage = ManageAPI(self.primary)
+        self._build_namespaces()
 
         self.md = builders.md
         self.kb = builders.Keyboard
@@ -185,7 +182,7 @@ class Main(Star):
             await asyncio.sleep(10)
             self._refresh_clients()
 
-    async def call(self, *args, **kwargs) -> dict:
+    async def call(self, *args, **kwargs) -> dict | list:
         """通用 call 通道，签名见 core/client.py。"""
         return await self.primary.call(*args, **kwargs)
 
@@ -218,6 +215,13 @@ class Main(Star):
         platform = getattr(getattr(event, "platform", None), "name", "") or ""
         if platform and platform not in ADAPTER_NAMES:
             return None, None, None
+        raw = getattr(mo, "raw_message", None)
+        guild_id = raw.get("guild_id") if isinstance(raw, dict) else getattr(raw, "guild_id", None)
+        channel_id = raw.get("channel_id") if isinstance(raw, dict) else getattr(raw, "channel_id", None)
+        if guild_id:
+            # AstrBot 将频道文字消息记为群消息、频道私信记为好友消息，需先看原始来源。
+            scene, target = ("guild", channel_id) if getattr(mo, "group_id", None) else ("dm", guild_id)
+            return scene, str(target) if target else None, getattr(mo, "message_id", None)
         group_id = getattr(mo, "group_id", None)
         if group_id:
             return "group", str(group_id), getattr(mo, "message_id", None)
@@ -256,7 +260,8 @@ class Main(Star):
           GROUP_MSG_RECEIVE；C2C：INTERACTION_CREATE/C2C_MSG_RECEIVE/FRIEND_ADD）；
           传 event_id_source 时校验，越界即丢弃并告警。
         - media 传 url/base64/本地路径（自动上传换 file_info）或
-          {"file_info": ...}（已上传直传）。
+          {"file_info": ...}（已上传直传）；频道/频道私信仅支持图片 URL。
+        - guild 的 target_openid 为子频道 ID；dm 为私信会话 guild_id。
         """
         if event is not None:
             ev_scene, ev_openid, ev_msg_id = self._resolve_event_target(event)
@@ -267,12 +272,12 @@ class Main(Star):
             scene = scene or ev_scene
             target_openid = target_openid or ev_openid
             msg_id = msg_id or ev_msg_id
-        if scene not in ("group", "c2c") or not target_openid:
+        if scene not in ("group", "c2c", "guild", "dm") or not target_openid:
             raise QQOfficeNotSupported(
-                "send_rich 需要 scene+target_openid（group/c2c）；频道场景请用 svc.guild.send"
+                "send_rich 需要 scene+target_openid（group/c2c/guild/dm）"
             )
 
-        if event_id and event_id_source:
+        if event_id and event_id_source and scene in ("group", "c2c"):
             allowed = EVENT_ID_SCOPES.get(scene, set())
             if event_id_source.upper() not in allowed:
                 logger.warning(
@@ -280,7 +285,7 @@ class Main(Star):
                 )
                 event_id = None
 
-        if markdown and reference:
+        if markdown and reference and scene in ("group", "c2c"):
             if on_mutex == "text_reference":
                 md_content = (markdown.get("markdown") or {}).get("content")
                 if md_content and not content:
@@ -292,7 +297,13 @@ class Main(Star):
                 logger.warning("[qqoffice_expand] markdown 与 reference 互斥：已丢弃 reference（on_mutex 可改）")
 
         payload: dict = dict(extra or {})
-        if media is not None:
+        if scene in ("guild", "dm"):
+            payload.pop("msg_type", None)
+            if media is not None:
+                if file_type != 1 or not isinstance(media, str) or not media.startswith(("https://", "http://")):
+                    raise QQOfficeNotSupported("频道 send_rich 的 media 支持图片 URL；本地图片请用 AstrBot 原生发送")
+                payload["image"] = media
+        elif media is not None:
             if not (isinstance(media, dict) and media.get("file_info")):
                 resp = await self.primary.upload_media(scene, target_openid, media, file_type)
                 media = {"file_info": resp.get("file_info")}
@@ -300,7 +311,7 @@ class Main(Star):
             payload["media"] = media
         else:
             payload.setdefault("msg_type", 2 if markdown else 0)
-        if markdown and content:
+        if markdown and content and scene in ("group", "c2c"):
             # 官方约束：传 markdown 时 content 必须为空，否则 22006
             logger.warning("[qqoffice_expand] markdown 与 content 互斥：已丢弃 content")
             content = None
@@ -313,9 +324,12 @@ class Main(Star):
         if reference:
             payload.update(reference)
 
-        path = ("/v2/groups/{group_openid}/messages" if scene == "group"
-                else "/v2/users/{user_openid}/messages")
-        key = "group_openid" if scene == "group" else "user_openid"
+        path, key = {
+            "group": ("/v2/groups/{group_openid}/messages", "group_openid"),
+            "c2c": ("/v2/users/{user_openid}/messages", "user_openid"),
+            "guild": ("/channels/{channel_id}/messages", "channel_id"),
+            "dm": ("/dms/{guild_id}/messages", "guild_id"),
+        }[scene]
         return await self.primary.call(
             "POST", path, path_params={key: target_openid}, json=payload,
             scene=scene, target_openid=target_openid,

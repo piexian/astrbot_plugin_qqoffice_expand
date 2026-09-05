@@ -34,7 +34,8 @@ ERROR_ADVICE: dict[int, str] = {
     40034024: "msg_id 无效或越权：检查 msg_id 是否正确、是否属于当前会话",
     40034025: "event_id 无效：检查 event_id 是否来自受支持事件（群侧 INTERACTION_CREATE/GROUP_ADD_ROBOT/GROUP_MSG_RECEIVE；C2C 侧 INTERACTION_CREATE/C2C_MSG_RECEIVE/FRIEND_ADD）",
     40034100: "主动消息配额超限：等待下一分钟后自动重试，或减少发送频率",
-    40034101: "单关系主动消息超限：等待后自动重试，或减少对该用户/群的推送",
+    40034101: "机器人非群成员：请先将机器人加入目标群聊",
+    40007: "流式消息已下发前缀不可修改：replace 模式必须保留已发送内容前缀",
     40054007: "文本长度超限：使用 client.chunk_text() 分块发送",
     40054010: "不允许发送 URL：群文本中「字母/汉字.字母」易被误判为链接，可开启 dot_replace 配置或手动把点替换为下划线",
     40034026: "event_id 已过期：请在收到事件后尽快回复",
@@ -45,7 +46,7 @@ ERROR_ADVICE: dict[int, str] = {
     40062003: "撤回无权限：需机器人为群管理员或仅撤回自己的消息",
     40064004: "已超出消息撤回时限（2 分钟）",
     11253: "应用无接口访问权限：该接口仅白名单机器人可用，联系平台运营申请",
-    40093001: "分片确认未就绪（平台异步）：属正常现象，需固定 1s 间隔持续重试（client 的 chunked 兜底已内置）",
+    40093001: "文件上传或分片转存失败：按 upload_config 的重试间隔与时限重试",
     40093002: "当日上传容量超限（每日累计 2G）：请明日再试或改用外链 URL",
     630001: "interaction 参数无效：检查请求参数",
     630002: "interaction 获取 appid 失败：检查 Authorization Header",
@@ -70,7 +71,7 @@ ERROR_ADVICE: dict[int, str] = {
     40030021: "全局面板不支持该操作：改用 target_type=specific",
 }
 
-RATE_LIMITED_CODES = frozenset({429, 40034100, 40034101})
+RATE_LIMITED_CODES = frozenset({429, 40034100})
 TOKEN_EXPIRED_CODES = frozenset({11244})
 # 官方 biz 码形态：4003xxxx / 4005xxxx / 4009300x（8 位）、220xx、63000x、11244
 _CODE_RE = _re.compile(r"\b(11244|220\d\d|4003\d{4}|4005\d{4}|4009300[12]|63000\d)\b")
@@ -125,6 +126,11 @@ def from_http_response(status: int, body, headers=None) -> QQOfficeAPIError | QQ
     """
     headers = headers or {}
     trace_id = headers.get("x-tps-trace-id") if hasattr(headers, "get") else None
+
+    if 200 <= status < 300 and isinstance(body, (dict, list, type(None))):
+        # 鉴权等调用会直接传入成功响应；正数业务 code 仍按错误处理。
+        if not isinstance(body, dict) or not isinstance(body.get("code"), int) or body["code"] <= 0:
+            return None
 
     # 网关/CDN 会返回 HTML 错误页，按 JSON 解析会崩
     if isinstance(body, str):

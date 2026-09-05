@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from .media import MediaAPI
 
 __all__ = ["C2CAPI", "InputNotifyHandle"]
 
@@ -27,7 +28,9 @@ class InputNotifyHandle:
         return self._task is None or self._task.done()
 
 
-class C2CAPI:
+class C2CAPI(MediaAPI):
+    _scene = "c2c"
+
     def __init__(self, client):
         self._client = client
 
@@ -40,6 +43,34 @@ class C2CAPI:
         body.update(extra or {})
         return await self._client.call(
             "POST", "/v2/users/{user_openid}/messages",
+            path_params={"user_openid": openid}, json=body,
+            scene="c2c", target_openid=openid,
+            msg_id=msg_id, event_id=event_id, msg_seq=msg_seq,
+        )
+
+    async def stream_send(self, openid: str, content_raw: str, *, index: int = 0,
+                          input_state: int = 1, input_mode: str = "append",
+                          content_type: str = "markdown", stream_msg_id: str | None = None,
+                          msg_id: str | None = None, event_id: str | None = None,
+                          msg_seq: int = 1, is_wakeup: bool | None = None,
+                          extra: dict | None = None) -> dict:
+        """发送一个流式分片（50 QPS）。index 从 0 递增，结束片 input_state=10。
+
+        首片返回的 id 用作后续 stream_msg_id；同一流沿用 msg_id/event_id 和 msg_seq。
+        replace 模式提交全量文本，已下发前缀不可修改。群聊不支持此接口。
+        被动窗口失效时首片抛错，不自动改变整条流的主动/被动模式。
+        """
+        body: dict[str, Any] = {
+            "content_raw": content_raw, "index": index, "input_state": input_state,
+            "input_mode": input_mode, "content_type": content_type,
+        }
+        for key, value in (("stream_msg_id", stream_msg_id), ("msg_id", msg_id),
+                           ("event_id", event_id), ("msg_seq", msg_seq), ("is_wakeup", is_wakeup)):
+            if value is not None:
+                body[key] = value
+        body.update(extra or {})
+        return await self._client.call(
+            "POST", "/v2/users/{user_openid}/stream_messages",
             path_params={"user_openid": openid}, json=body,
             scene="c2c", target_openid=openid,
             msg_id=msg_id, event_id=event_id, msg_seq=msg_seq,

@@ -10,6 +10,10 @@ class ManageAPI:
     def __init__(self, client):
         self._client = client
 
+    async def me(self, *, extra: dict | None = None) -> dict:
+        """机器人自身信息（50 QPS），保留 share_url、welcome_msg 等原始字段。"""
+        return await self._client.call("GET", "/users/@me", params=extra)
+
     async def interaction_ack(self, interaction_id: str, code: int = 0,
                               *, extra: dict | None = None) -> dict:
         """PUT /interactions/{interaction_id}：按钮/快捷菜单回调必须在 3 秒内

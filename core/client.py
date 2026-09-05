@@ -1,8 +1,8 @@
 """通用 call 通道（扩展位核心），路径 A/B 在此收敛。
 
 内建：端点频控、主动消息配额、无状态 msg_seq、被动窗口自动降级（群 5min/5
-次、C2C 60min/4 次）、401/11244 清 token 重试一次、429/40034100/40034101
-等待重试、HTML 网关页识别、错误标准化、出站 ref_idx 入引用索引、群文本
+次、C2C 60min/4 次）、401/11244 清 token 重试一次、429/40034100 与流式
+50002 频控等待重试、HTML 网关页识别、错误标准化、出站 ref_idx 入引用索引、群文本
 点号替换（可选）。超时按路径自适应：含 /files、upload_ 的 120s，其余 30s。
 """
 
@@ -21,6 +21,7 @@ from .auth import QQClientBundle, SelfClient
 from .errors import QQOfficeAPIError, QQOfficeGatewayError, QQOfficeNotSupported
 from .ratelimit import RateLimiter
 from .refstore import RefStore
+from .http_capture import capture_response_status
 
 __all__ = ["QQOfficeClient", "PassiveWindowTracker", "generate_msg_seq"]
 
@@ -81,22 +82,32 @@ class PassiveWindowTracker:
 
 # 端点 key 解析表（顺序敏感；新端点在此加一行即可）
 _ENDPOINT_PATTERNS: list[tuple[_re.Pattern, str]] = [
-    (_re.compile(r"/messages/\{[^}]+\}$"), "{scene}.recall"),
+    (_re.compile(r"/messages/[^/]+$"), "{scene}.message_get_or_recall"),
     (_re.compile(r"/messages$"), "{scene}.send"),
+    (_re.compile(r"^/v2/users/[^/]+/stream_messages$"), "c2c.stream"),
     (_re.compile(r"/files$"), "{scene}.files"),
-    (_re.compile(r"upload_prepare$"), "group.upload_prepare"),
-    (_re.compile(r"upload_part_finish$"), "group.upload_part_finish"),
-    (_re.compile(r"/interactions/\{[^}]+\}$"), "interactions.ack"),
+    (_re.compile(r"upload_prepare$"), "{scene}.upload_prepare"),
+    (_re.compile(r"upload_part_finish$"), "{scene}.upload_part_finish"),
+    (_re.compile(r"/interactions/[^/]+$"), "interactions.ack"),
     (_re.compile(r"/bot_state$"), "{scene}.bot_state"),
     (_re.compile(r"/join_request_list$"), "group.join_requests"),
     (_re.compile(r"/approval_join_request/"), "group.join_approve"),
+    (_re.compile(r"^/v2/groups/[^/]+/members/[^/]+$"), "group.member_info"),
+    (_re.compile(r"^/v2/groups/[^/]+/members$"), "group.members"),
+    (_re.compile(r"/batch_remove_members$"), "group.remove_members"),
+    (_re.compile(r"/member_blacklist$"), "group.blacklist_get_or_set"),
     (_re.compile(r"/restrict_chat_setting$"), "{scene}.mute_get_or_set"),
     (_re.compile(r"join_approval_strategy"), "group.strategy"),
     (_re.compile(r"/info$"), "{scene}.info"),
     (_re.compile(r"/v2/menu$"), "menu.get_or_put"),
-    (_re.compile(r"/v2/panels/\{[^}]+\}/target$"), "panels.target"),
-    (_re.compile(r"/v2/panels/\{[^}]+\}$"), "panels.get_or_write_or_del"),
+    (_re.compile(r"/v2/panels/[^/]+/target$"), "panels.target"),
+    (_re.compile(r"/v2/panels/[^/]+$"), "panels.get_or_write_or_del"),
     (_re.compile(r"/v2/panels$"), "panels.list_or_create"),
+    (_re.compile(r"^/guilds/[^/]+/channels$"), "guild.channels"),
+    (_re.compile(r"^/guilds/[^/]+$"), "guild.info"),
+    (_re.compile(r"^/channels/[^/]+$"), "guild.channel"),
+    (_re.compile(r"^/users/@me/guilds$"), "guild.list"),
+    (_re.compile(r"^/users/@me$"), "bot.me"),
 ]
 
 def resolve_endpoint_key(method: str, path: str, scene: str | None) -> str:
@@ -107,6 +118,12 @@ def resolve_endpoint_key(method: str, path: str, scene: str | None) -> str:
             break
     if key_tpl is None:
         return "default"
+    if key_tpl == "{scene}.send" and method.upper() != "POST":
+        return "default"
+    if key_tpl == "{scene}.message_get_or_recall":
+        return f"{scene}.message_get" if method.upper() == "GET" else f"{scene}.recall"
+    if key_tpl == "group.blacklist_get_or_set":
+        return "group.blacklist" if method.upper() == "GET" else "group.set_blacklist"
     if key_tpl == "{scene}.mute_get_or_set":
         return f"{scene or 'group'}.mute_get" if method.upper() == "GET" else f"{scene or 'group'}.mute_set"
     if key_tpl == "menu.get_or_put":
@@ -171,8 +188,8 @@ class QQOfficeClient:
         event_id: str | None = None,
         msg_seq: int | None = None,
         timeout: float | None = None,
-    ) -> dict:
-        """调用任意官方端点，返回原始响应 dict（错误抛 QQOfficeAPIError 系）。"""
+    ) -> dict | list:
+        """调用任意官方端点，保留响应对象或数组（错误抛 QQOfficeAPIError 系）。"""
         method = method.upper()
         path_params = dict(path_params or {})
         try:
@@ -187,16 +204,31 @@ class QQOfficeClient:
         self.calls_total += 1
 
         payload = dict(json or {})
-        is_send = endpoint_key.endswith(".send")
+        is_stream = endpoint_key == "c2c.stream"
+        is_send = (endpoint_key.endswith(".send") or is_stream
+                   or (endpoint_key.endswith(".files") and bool(payload.get("srv_send_msg"))))
+        # 流式续片属于同一条回复，不能每片都扣掉一次普通消息的回复额度。
+        continuation = is_stream and bool(payload.get("stream_msg_id"))
         degraded = False
-        if is_send:
+        stream_reply_id = msg_id or payload.get("msg_id")
+        if is_stream and not continuation and stream_reply_id and not payload.get("is_wakeup"):
+            ok, reason = self.windows.check("c2c", stream_reply_id)
+            if not ok:
+                # 静默降级首片会使调用方沿用的续片引用参数与首片不一致。
+                raise QQOfficeAPIError(40034128, f"流式被动回复窗口失效（{reason}），请显式发起主动流")
+        if is_send and not continuation:
             payload, degraded = await self._prepare_message_payload(
-                payload, scene, target_openid, msg_id, event_id, msg_seq
+                payload, scene, target_openid,
+                None if is_stream and payload.get("is_wakeup") else msg_id, event_id, msg_seq
             )
             if degraded:
                 self._log("warning", f"被动窗口失效，已降级为主动消息: target={target_openid}")
+        elif continuation:
+            for key, value in (("msg_id", msg_id), ("event_id", event_id), ("msg_seq", msg_seq)):
+                if value is not None:
+                    payload[key] = value
 
-        await self.limiter.acquire(endpoint_key)
+        await self.limiter.acquire(endpoint_key, target=target_openid if scene == "guild" else None)
 
         if timeout is None:
             timeout = UPLOAD_TIMEOUT if ("/files" in full_path or "upload_" in full_path) else DEFAULT_TIMEOUT
@@ -213,7 +245,7 @@ class QQOfficeClient:
                     token_retry_used = True
                     await self._refresh_token()
                     continue
-                if exc.code == 429 or exc.code in qo_errors.RATE_LIMITED_CODES:
+                if exc.code == 429 or exc.code in qo_errors.RATE_LIMITED_CODES or (is_stream and exc.code == 50002):
                     if rate_attempts < retry_max:
                         rate_attempts += 1
                         await asyncio.sleep(min(30.0, 1.0 * rate_attempts))
@@ -232,11 +264,11 @@ class QQOfficeClient:
             refstore = self.refstore
             if is_send and scene and target_openid:
                 refstore.record_outbound(scene, target_openid, result)
-            if is_send:
+            if is_send and not continuation and not payload.get("is_wakeup"):
                 used_msg_id = payload.get("msg_id")
                 if used_msg_id:
                     self.windows.record(scene or "group", used_msg_id)
-        return result if isinstance(result, dict) else {}
+        return result if isinstance(result, (dict, list)) else {}
 
     async def _prepare_message_payload(
         self,
@@ -257,19 +289,21 @@ class QQOfficeClient:
             if not ok:
                 if self.config.get("auto_degrade_proactive", True):
                     msg_id = None
+                    payload.pop("msg_id", None)
+                    payload.pop("msg_seq", None)
                     degraded = True
                 else:
                     raise QQOfficeAPIError(40034005, f"被动回复窗口失效（{reason}），且未开启自动降级")
         if msg_id:
             payload["msg_id"] = msg_id
-            payload.setdefault("msg_seq", msg_seq or generate_msg_seq())
+            payload.setdefault("msg_seq", msg_seq if msg_seq is not None else generate_msg_seq())
         elif event_id:
             payload["event_id"] = event_id
 
         # 纯主动消息才消耗配额（被动回复不受主动配额限制）
         if "msg_id" not in payload and "event_id" not in payload and not payload.get("is_wakeup"):
-            if target_openid:
-                await self.limiter.consume_proactive(str(target_openid))
+            if target_openid and scene in ("group", "c2c"):
+                await self.limiter.consume_proactive(str(target_openid), scene=scene)
 
         if (
             self.config.get("dot_replace", False)
@@ -280,15 +314,15 @@ class QQOfficeClient:
         return payload, degraded
 
     async def _dispatch(self, method: str, full_path: str, params: dict | None,
-                        payload: dict | None, timeout: float) -> dict:
+                        payload: dict | None, timeout: float) -> dict | list:
         if self.bundle is not None:
             return await self._dispatch_adapter(method, full_path, params, payload, timeout)
         return await self._dispatch_self(method, full_path, params, payload, timeout)
 
     async def _dispatch_adapter(self, method: str, full_path: str, params: dict | None,
-                                payload: dict | None, timeout: float) -> dict:
+                                payload: dict | None, timeout: float) -> dict | list:
         try:
-            from botpy.http import Route  # 延迟导入，保持 core 零顶层 botpy 依赖
+            import botpy.http as botpy_http  # 延迟导入，保持 core 零顶层 botpy 依赖
         except Exception as e:  # pragma: no cover
             raise QQOfficeNotSupported(f"botpy 不可用，路径 A 失效: {e}")
 
@@ -296,7 +330,7 @@ class QQOfficeClient:
         http = getattr(api, "_http", None)
         if http is None:
             raise QQOfficeNotSupported("适配器客户端缺少 _http（botpy BotHttp），无法发起请求")
-        route = Route(method, full_path)
+        route = botpy_http.Route(method, full_path)
         # botpy BotHttp.request 内部固定注入 client 级 timeout，透传 timeout 会撞关键字；
         # 路径 A 的 per-request timeout 不可用，仅路径 B（自建 HTTP）生效
         kwargs: dict[str, Any] = {}
@@ -305,19 +339,24 @@ class QQOfficeClient:
         if payload is not None:
             kwargs["json"] = payload
         try:
-            result = await http.request(route, **kwargs)
+            with capture_response_status(botpy_http) as captured:
+                result = await http.request(route, **kwargs)
         except Exception as exc:  # botpy 抛 RuntimeError 子类
-            err = qo_errors.from_exception(exc)
+            err = captured.get("error") or qo_errors.from_exception(exc)
             if err is None:
                 raise
             raise err from exc
-        # botpy 在超时/重试耗尽时静默返回 None（http.py:156-186）
+        # SDK 对 200/204 空响应和超时都返回 None，必须根据本次请求实际状态区分。
         if result is None:
+            if 200 <= captured.get("status", 0) < 300:
+                return {}
             raise QQOfficeGatewayError(504, None, "botpy 请求超时或重试耗尽（返回空）")
-        return result if isinstance(result, dict) else {"raw": result}
+        if isinstance(result, dict) and isinstance(result.get("code"), int) and result["code"] > 0 and result.get("message"):
+            raise qo_errors.from_http_response(400, result)
+        return result if isinstance(result, (dict, list)) else {}
 
     async def _dispatch_self(self, method: str, full_path: str, params: dict | None,
-                             payload: dict | None, timeout: float) -> dict:
+                             payload: dict | None, timeout: float) -> dict | list:
         assert self.self_client is not None
         status, body, headers = await self.self_client.request(
             method, full_path, params=params, json=payload, timeout=timeout
@@ -331,7 +370,7 @@ class QQOfficeClient:
             err = qo_errors.from_http_response(status, body, headers)
             if err:
                 raise err
-        return body if isinstance(body, dict) else {}
+        return body if isinstance(body, (dict, list)) else {}
 
     async def _refresh_token(self) -> None:
         """401/11244 后强制换 token。"""
@@ -374,16 +413,14 @@ class QQOfficeClient:
             )
 
         data = await up.load_bytes()
-        chash = self.refstore.content_hash(data)
-        cached = self.refstore.get_file_info(chash, scene, openid, file_type)
-        if cached:
-            return {"file_info": cached, "cached": True}
-
         if scene == "c2c" and file_type == 3:
             from .media import strip_amr_header
 
             data, _ = strip_amr_header(data)
-            chash = self.refstore.content_hash(data)
+        chash = self.refstore.content_hash(data)
+        cached = self.refstore.get_file_info(chash, scene, openid, file_type)
+        if cached and not srv_send_msg:
+            return {"file_info": cached, "cached": True}
 
         resp = await self.call(
             "POST", path,
