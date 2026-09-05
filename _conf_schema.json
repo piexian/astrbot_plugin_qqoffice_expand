@@ -1,26 +1,39 @@
 {
-  "prefer_new_domain": {
-    "type": "bool",
-    "description": "启用统一新域名",
-    "hint": "改用 api.bot.qq.com 并同步改写 botpy 请求域名；官方下线旧域名时再开",
-    "default": false
-  },
-  "sandbox": {
-    "type": "bool",
-    "description": "沙箱环境",
-    "hint": "使用 sandbox 域名，仅联调测试时开启",
-    "default": false
-  },
   "certified_bot": {
     "type": "bool",
-    "description": "认证主体机器人",
-    "hint": "影响主动消息频控档位：认证 60 条/分钟，未认证 30 条/分钟",
+    "description": "认证主体机器人（全局默认）",
+    "hint": "群聊认证 60/分钟、未认证 30/分钟；C2C 认证 10/秒、未认证 5/秒且 30/分钟。可被下方「按机器人覆盖」逐 AppID 覆盖",
     "default": false
+  },
+  "certified_bots": {
+    "type": "template_list",
+    "description": "按机器人 AppID 覆盖认证限额",
+    "hint": "同 AppID 多实例只读一份；未列出的 AppID 使用全局默认",
+    "default": [],
+    "templates": {
+      "certified": {
+        "description": "机器人认证限额条目",
+        "items": {
+          "appid": {
+            "type": "string",
+            "description": "机器人 AppID",
+            "hint": "与平台适配器配置中的 appid 一致",
+            "default": ""
+          },
+          "certified": {
+            "type": "bool",
+            "description": "认证主体",
+            "hint": "true=按认证主体限额，false=按未认证限额",
+            "default": false
+          }
+        }
+      }
+    }
   },
   "auto_degrade_proactive": {
     "type": "bool",
     "description": "超窗自动降级主动消息",
-    "hint": "被动窗口超窗/超次时降级主动消息；关闭则超窗直接抛错",
+    "hint": "被动回复窗口（群 5 分钟/5 次、C2C 60 分钟/4 次）超窗/超次时降级主动消息；关闭则超窗直接抛错",
     "default": true
   },
   "dot_replace": {
@@ -32,25 +45,31 @@
   "interaction_auto_ack": {
     "type": "bool",
     "description": "互动事件自动应答",
-    "hint": "3 秒时限内自动 code=0 应答；需自定义应答内容时关闭",
+    "hint": "仅按钮和快捷菜单（type=11/12）在 3 秒内按来源机器人自动 code=0 应答；需自定义应答内容时关闭",
     "default": true
   },
   "enable_group_member_events": {
     "type": "bool",
     "description": "订阅群成员进出事件",
-    "hint": "intent 1<<24；改动后重载一次 QQ 官方适配器生效",
+    "hint": "intent 1<<24；改动后重载一次 QQ 官方平台适配器生效",
     "default": true
   },
   "ref_ttl_days": {
     "type": "int",
     "description": "引用索引留存天数",
-    "hint": "msg_idx/ref_idx 本地留存；0 表示不落盘仅内存",
+    "hint": "msg_idx/ref_idx 本地留存（按机器人身份隔离）；0 表示不落盘仅内存",
     "default": 7
+  },
+  "ref_max_entries": {
+    "type": "int",
+    "description": "引用索引全插件容量上限",
+    "hint": "全局 LRU 上限，不随实例数量增长",
+    "default": 50000
   },
   "retry_max": {
     "type": "int",
     "description": "频控重试次数上限",
-    "hint": "命中 429 类频控时自动等待重试；token 重试固定 1 次不受控",
+    "hint": "命中 429 类频控时自动等待重试（重试前核验同一机器人与代次）；token 重试固定 1 次不受控",
     "default": 3
   }
 }

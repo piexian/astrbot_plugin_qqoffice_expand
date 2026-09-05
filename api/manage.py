@@ -10,17 +10,26 @@ class ManageAPI:
     def __init__(self, client):
         self._client = client
 
+    async def me(self, *, extra: dict | None = None) -> dict:
+        """机器人自身信息（50 QPS），保留 share_url、welcome_msg 等原始字段。"""
+        return await self._client.call("GET", "/users/@me", params=extra)
+
     async def interaction_ack(self, interaction_id: str, code: int = 0,
-                              *, extra: dict | None = None) -> dict:
+                              *, extra: dict | None = None, _phase=None) -> dict:
         """PUT /interactions/{interaction_id}：按钮/快捷菜单回调必须在 3 秒内
-        应答，同一 id 只能应答一次。code: 0成功 1失败 2频繁 3重复 4无权限 5仅管理员。"""
+        应答，同一 id 只能应答一次。code: 0成功 1失败 2频繁 3重复 4无权限 5仅管理员。
+
+        _phase 为内部参数：自动 ACK 的阶段跟踪器（进入 SDK 置位），调用方无需传。
+        """
         body: dict[str, Any] = {"code": code}
         body.update(extra or {})
-        return await self._client.call(
-            "PUT", "/interactions/{interaction_id}",
+        kwargs = dict(
             path_params={"interaction_id": interaction_id},
             json=body, endpoint_key="interactions.ack",
         )
+        if _phase is not None:
+            kwargs["_phase"] = _phase
+        return await self._client.call("PUT", "/interactions/{interaction_id}", **kwargs)
 
     async def menu_get(self, *, extra: dict | None = None) -> dict:
         """查询当前自定义菜单（30 QPM）。未设置时 menu 字段为空。"""

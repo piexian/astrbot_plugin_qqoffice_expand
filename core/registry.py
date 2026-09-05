@@ -29,7 +29,7 @@ class Registry:
         self._methods: dict[str, tuple[Callable, MethodMeta]] = {}
 
     def register_fn(self, name: str, fn: Callable, meta: MethodMeta | None = None) -> None:
-        """同名重复注册视为重绑定（适配器后到时命名空间会随 primary 客户端重建）。"""
+        """同名重复注册视为重绑定（目录在构造时注册一次，方法为未绑定函数）。"""
         self._methods[name] = (fn, meta or MethodMeta())
 
     def get(self, name: str) -> tuple[Callable, MethodMeta]:
@@ -54,12 +54,16 @@ class Registry:
 
 
 def collect_methods(obj: Any) -> dict[str, Callable]:
-    """收集实例上非下划线的公开方法（bound）。"""
+    """收集对象类上的公开方法（未绑定函数）。
+
+    目录只构建一次；调用时以「视图代理」为 self 调用（见 main.BoundView.invoke），
+    代理把 self._client 指到具体视图，避免共享命名空间实例的可变绑定。
+    """
     out: dict[str, Callable] = {}
     for attr in dir(obj):
         if attr.startswith("_"):
             continue
-        fn = getattr(obj, attr, None)
-        if callable(fn) and inspect.ismethod(fn):
+        fn = getattr(type(obj), attr, None)
+        if callable(fn) and inspect.isfunction(fn):
             out[attr] = fn
     return out
