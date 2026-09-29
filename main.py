@@ -87,6 +87,7 @@ class Main(Star):
     # ---------------- 生命周期 ----------------
 
     async def initialize(self) -> None:
+        self._service._check_open()
         try:
             await self._initialize()
         except BaseException:

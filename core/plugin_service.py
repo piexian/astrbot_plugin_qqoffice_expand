@@ -142,14 +142,18 @@ class QQOfficeService:
     # ---------------- 生命周期钩子（由插件本体调用） ----------------
 
     def mark_ready(self) -> None:
+        self._check_open()
         self._state, self._reason = "ready", None
 
     def mark_unavailable(self, reason: str) -> None:
+        if self._state in ("closing", "closed"):
+            return
         self._state, self._reason = "unavailable", reason
 
     def mark_closing(self) -> None:
         """terminate 一开始调用：立即拒绝新业务（在途操作由路由层收尾）。"""
-        self._state, self._reason = "closing", "service_closed"
+        if self._state != "closed":
+            self._state, self._reason = "closing", "service_closed"
 
     def mark_closed(self) -> None:
         """terminate 清理完成后调用：旧服务永久失效；get_status 仍可查询。"""

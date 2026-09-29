@@ -587,6 +587,44 @@ async def test_readme_binding_checks_service_readiness():
         )
 
 
+async def test_closed_main_rejects_reinitialization():
+    async with service() as (svc, _, _):
+        facade = svc.get_service()
+        await svc.terminate()
+        restarted = []
+
+        async def restart():
+            restarted.append(True)
+
+        svc._initialize = restart
+        try:
+            await svc.initialize()
+            rejected = False
+        except PS.ServiceClosedError:
+            rejected = True
+        t("已关闭 Main 拒绝再次初始化且不创建资源", rejected and not restarted)
+        t("旧门面保持 closed", facade.get_status()["state"] == "closed")
+
+
+async def test_lifecycle_hooks_cannot_reopen_service():
+    for close in ("mark_closing", "mark_closed"):
+        async with service(initial=False) as (svc, _, _):
+            facade = svc.get_service()
+            getattr(facade, close)()
+            state = facade.state
+            try:
+                facade.mark_ready()
+                rejected = False
+            except PS.ServiceClosedError:
+                rejected = True
+            t(f"{state} 拒绝转回 ready", rejected and facade.state == state)
+            facade.mark_unavailable("late_initialize_failure")
+            t(f"{state} 不被迟到的初始化异常覆盖", facade.state == state)
+            facade.mark_closed()
+            facade.mark_closing()
+            t("重复关闭保持 closed", facade.state == "closed")
+
+
 async def _main():
     await test_discovery_and_version()
     await test_state_lifecycle_and_wait_ready()
@@ -594,6 +632,8 @@ async def _main():
     await test_reload_new_service_identity()
     await test_facade_binding_routing()
     await test_readme_binding_checks_service_readiness()
+    await test_closed_main_rejects_reinitialization()
+    await test_lifecycle_hooks_cannot_reopen_service()
 
 
 if __name__ == "__main__":
