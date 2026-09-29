@@ -125,8 +125,35 @@ async def reply_in_guild_dm(qq, dm_guild_id, message_id, content):
     return await qq.guild.dm_send(dm_guild_id, content, msg_id=message_id)
 ```
 
-示例中的 `qq = svc.instance(id)` 或 `qq = svc.for_event(event)` 需先绑定；
-根服务 `svc` 只提供构建器、全局订阅、实例查询与状态，不直接调用接口。
+示例中的 `qq = service.instance(id)` 或 `qq = service.for_event(event)` 需先绑定；
+根服务 `service` 只提供构建器、全局订阅、实例查询与状态，不直接调用接口。
+
+## 服务门面（SDK v1）
+
+其他插件通过原生注册表发现本插件并取得公开服务门面：
+
+```python
+meta = context.get_registered_star("astrbot_plugin_qqoffice_expand")
+if meta and meta.activated and meta.star_cls is not None \
+        and callable(getattr(meta.star_cls, "get_service", None)):
+    service = meta.star_cls.get_service(api_version=1)   # 不兼容时抛 unsupported_version
+    status = service.get_status()   # 同步本地快照：无网络、不 refresh 路由
+```
+
+- `get_status()`：`{api_version, instance_id, state, ready, reason, instances}`；
+  `state` 为 initializing/ready/unavailable/closing/closed，根服务就绪与
+  平台连接就绪分开（`instances` 快照只含安全字段，无 token/secret/config）。
+- `capabilities()`：`{api_version: 1, features: [qq.instance, qq.events,
+  qq.rich_message, qq.group, qq.c2c, qq.guild, qq.manage]}`，实现支持 ≠
+  账号已获平台权限。
+- `await wait_ready(timeout)`：成功返回状态快照，超时抛 `TimeoutError`，
+  closing/closed 抛 `code="service_closed"` 的 RuntimeError。
+- 委托入口：`instance(id)`、`for_event(event)`、`on(event_type, handler)`、
+  `on_any(handler)`、`md/kb/btn/reference/md_image`、`ref_from_event(event)`；
+  业务调用一律经绑定视图，门面不透传任意属性，无根级 send_rich/group。
+- 生命周期：插件 terminate 开始即拒绝新业务（closing），清理后永久 closed；
+  重载后新服务 `instance_id` 不同。旧入口 `star_cls.ready/status()/wait_ready()`
+  （布尔）保留兼容。
 
 ## 验证
 
@@ -140,6 +167,7 @@ python3 -B tests/api_contract_test.py
 python3 -B tests/intents_patch_test.py
 python3 -B tests/integration_test.py
 python3 -B tests/main_assembly_test.py
+python3 -B tests/sdk_service_test.py
 ```
 
 以上为本次 N 实例版本的离线契约/路由/生命周期/真实 Main 装配检查；模拟 HTTP
