@@ -5,7 +5,7 @@
 多实例语义：
 
 - 每个 AstrBot 配置实例（平台 ID）绑定到一个机器人身份（AppID + 生产/沙箱）；同 AppID 同环境的多实例共享配额、被动回复计数、ACK 去重与引用缓存，不同身份完全隔离。
-- 主动调用必须**明确选实例**（`svc.instance(id)`）；事件回复通过 `svc.for_event(event)` 自动绑定来源机器人。没有"全局默认机器人"。
+- 主动调用必须**明确选实例**（`service.instance(id)`）；事件回复通过 `service.for_event(event)` 自动绑定来源机器人。没有"全局默认机器人"。
 - 实例重载/换连接不清零未过期用量；实例被删除/禁用后新请求立即拒绝（不等轮询）；旧事件与跨代次的进行中操作明确失败，不会把消息发到另一台机器人。
 
 > **intents 生效时机**：扩展 intents 位只能随 WS identify 下发。插件会在适配器实例化时自动注入扩展位（首次构造即生效）；**已建立的 WS 会话若缺少所需 intents，请在管理面板重载对应的 QQ 官方 WS 适配器**，让新 identify 携带扩展位。Webhook 不依赖 WS identify，不因此要求重启。若扩展位未在 QQ 开放平台开通权限导致 identify 被网关 4013/4014 拒断，插件会**按实例**剔除扩展位保住基础连接并日志提示（其他实例不受影响）；开通权限后重载相关适配器即可重新申请本代次权限。
@@ -22,7 +22,7 @@ __平台支持__: 仅 QQ 官方机器人适配器（`qq_official` websocket 模�
 
 ## 功能
 
-- **N 实例路由** - `svc.instance(id)` / `svc.for_event(event)` 绑定视图；平均 O(1) 定位本体当前实例与代次；同 AppID 共享、跨身份隔离
+- **N 实例路由** - `service.instance(id)` / `service.for_event(event)` 绑定视图（SDK v1 公开门面）；平均 O(1) 定位本体当前实例与代次；同 AppID 共享、跨身份隔离
 - 群管理命名方法 - 成员列表与详情、批量移除、群黑名单、撤回、禁言、入群审批、自动审批策略 6 件套、群信息与机器人状态
 - 单聊命名方法 - 独立流式分片、撤回、全参数发送、输入中状态、互动召回、富媒体上传
 - 分片上传控制 - 群聊/C2C 的预上传、分片确认和合并接口
@@ -60,8 +60,9 @@ __平台支持__: 仅 QQ 官方机器人适配器（`qq_official` websocket 模�
 
 ## 使用
 
-消费方是其他 AstrBot 插件：通过 `get_registered_star` 拿到 `star_cls` 作为 svc。
-加载顺序不可控（AstrBot 无插件排序能力），标准接法是「initialize 内先试绑定
+消费方是其他 AstrBot 插件：通过 `get_registered_star` 按插件名发现，再取
+`get_service(api_version=1)` 公开门面（SDK v1）。加载顺序不可控（AstrBot
+无插件排序能力），标准接法是「initialize 内先试绑定
 + 收加载广播再绑定」，**不要在 initialize() 里阻塞等待**：
 
 ```python
@@ -74,19 +75,29 @@ PLUGIN = "astrbot_plugin_qqoffice_expand"
 class MyPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context, config)
-        self.qq = None          # 绑定的服务实例
+        self.qq = None          # 绑定的服务门面
         self._unsubs = []       # 本插件在服务上的订阅，卸载时解绑
 
     def _try_bind(self) -> bool:
         """绑定目标服务并注册订阅；重复调用（服务未变）幂等。"""
         meta = self.context.get_registered_star(PLUGIN)
-        if not (meta and meta.activated and meta.star_cls
-                and getattr(meta.star_cls, "ready", False)):
+        if not (meta and meta.activated and meta.star_cls):
+            return False                    # missing / disabled / no_instance
+        getter = getattr(meta.star_cls, "get_service", None)
+        if not callable(getter):
+            return False                    # unsupported_api：需升级提供者
+        try:
+            service = getter(api_version=1)   # 不兼容时抛 code=unsupported_version
+        except RuntimeError as exc:
+            logger.warning("无法接入 qqoffice SDK：%s", getattr(exc, "code", "sdk_error"))
             return False
-        if self.qq is meta.star_cls:
+        if not service.get_status()["ready"]:
+            self._unbind()
+            return False
+        if self.qq is service:
             return True   # 同一服务实例已绑定，不重复订阅
-        self._unbind()      # 服务重载后是新实例：先解绑旧订阅
-        self.qq = meta.star_cls
+        self._unbind()      # 服务重载后是新实例（instance_id 不同）：先解绑旧订阅
+        self.qq = service
         self._unsubs.append(
             self.qq.on("INTERACTION_CREATE", self._on_button))  # 全局订阅
         return True
@@ -133,10 +144,41 @@ class MyPlugin(Star):
         await qq.send_rich(content="已收到按钮操作")
 ```
 
+### 状态与能力（本地快照，无网络副作用）
+
+```python
+service = self.qq
+status = service.get_status()
+# {"api_version": 1, "instance_id": "…本次加载唯一", "state": "ready",
+#  "ready": True, "reason": None,
+#  "instances": {"qq_sales": {"adapter": "qq_official", "mode": "ws",
+#      "appid": "…", "environment": "production", "generation": 1,
+#      "transport_ready": True, "closing": False, …}}}
+cap = service.capabilities()   # {"api_version": 1, "features": ["qq.instance", …]}
+```
+
+- 状态：`state` 为 initializing / ready / unavailable / closing / closed，
+  `ready` 当且仅当 state 为 ready；根服务 initialize 成功即 ready，
+  **与平台连接就绪分开**（平台可用性看 `instances` 快照的
+  `transport_ready`/`closing`）。查询无网络、不 refresh 路由，快照只含
+  安全字段（无 token/secret/config）。实例快照可能滞后，实际调用仍核验
+  本体当前实例和代次，不能用快照代替路由校验。
+- 等待：`await service.wait_ready(timeout=5)` 成功返回状态快照；超时抛
+  `TimeoutError`；closing/closed 抛带 `code="service_closed"` 的
+  RuntimeError。不要无界等待；也不要在 initialize 里等它（会卡住后续
+  插件加载）。
+- 重载：插件重载后旧服务永久失效（closed），新服务 `instance_id` 不同；
+  用 `status["instance_id"]` 识别服务换代。
+- 发现层与服务状态分开：`meta is None` / `meta.activated=False` /
+  `star_cls is None` / 无 `get_service` / 版本不兼容，各自明确判断，
+  不能从服务 ready 推断插件是否安装。旧入口 `star_cls.ready` /
+  `star_cls.status()` / `star_cls.wait_ready()`（布尔）保留兼容，
+  新接入请统一走门面。
+
 ### 主动调用：明确选实例
 
 ```python
-qq = svc.instance("qq_sales")            # AstrBot 平台配置 ID
+qq = service.instance("qq_sales")            # AstrBot 平台配置 ID
 await qq.group.send(group_openid, "通知")            # 纯主动消息
 await qq.invoke("group.recall", openid, message_id)  # 命名方法泛化调用
 resp = await qq.call("GET", "/v2/groups/{group_openid}/info",
@@ -149,9 +191,9 @@ unsub = qq.on("GROUP_MEMBER_ADD", handler)           # 只收这台机器人的�
 ```
 
 使用时机与身份固定：AstrBot 中插件 initialize 先于平台实例化，因此
-`svc.instance(id)` 要求目标平台已在运行索引中（不可用 ID 立即抛
+`service.instance(id)` 要求目标平台已在运行索引中（不可用 ID 立即抛
 `InstanceUnavailable`），并在**创建时即固定机器人身份**：同 ID 改绑另一
-AppID 后旧视图调用抛 `InstanceIdentityChanged`（需重新 `svc.instance(id)`）；
+AppID 后旧视图调用抛 `InstanceIdentityChanged`（需重新 `service.instance(id)`）；
 同身份重载则自动跟随。平台未就绪时，请在 `@filter.on_platform_loaded()`
 钩子或事件回调中创建视图（平台加载不代表 token 已登录，请求就绪由传输
 检查判定，未登录时报 `TransportNotReady`）。
@@ -159,9 +201,9 @@ AppID 后旧视图调用抛 `InstanceIdentityChanged`（需重新 `svc.instance(
 ### 事件回复：自动绑定来源
 
 ```python
-qq = svc.for_event(astr_message_event)   # 原生事件：platform_id + event.bot 核验
-qq = svc.for_event(qqoffice_event)       # 扩展事件：不可变来源 + 代次核验
-await qq.send_rich(markdown=svc.md("签到成功"))   # 视图持有事件目标，不必再传 event
+qq = service.for_event(astr_message_event)   # 原生事件：platform_id + event.bot 核验
+qq = service.for_event(qqoffice_event)       # 扩展事件：不可变来源 + 代次核验
+await qq.send_rich(markdown=service.md("签到成功"))   # 视图持有事件目标，不必再传 event
 await qq.send_rich(content="纯文本回复")
 # 也可显式指定目标：qq.send_rich(scene="group", target_openid=..., content=...)
 ```
@@ -177,13 +219,13 @@ INTERACTION_CREATE/C2C_MSG_RECEIVE/FRIEND_ADD）时自动推断，并按与显�
 ### 富消息 / 引用回复
 
 ```python
-qq = svc.for_event(event)
+qq = service.for_event(event)
 await qq.send_rich(
-    markdown=svc.md("# 签到成功\n积分 **50**"),
-    keyboard=svc.kb().row(svc.btn("签到", data="/签到", enter=True)).build(),
+    markdown=service.md("# 签到成功\n积分 **50**"),
+    keyboard=service.kb().row(service.btn("签到", data="/签到", enter=True)).build(),
 )
 await qq.send_rich(content="收到",
-                   reference=svc.reference(svc.ref_from_event(event)))
+                   reference=service.reference(service.ref_from_event(event)))
 ```
 
 原生 AstrBot 消息的引用同样可用：`ref_from_event` 从本体保留的原始
@@ -210,14 +252,14 @@ payload（`message.raw_data`）提取 msg_idx 并按机器人命名空间入库�
 
 | # | 能力 | 步骤 | 预期 |
 | --- | --- | --- | --- |
-| 1 | 实例路由 | 双实例环境分别 `svc.instance(id).group.info(...)` | 各自返回对应机器人视角的群信息 |
+| 1 | 实例路由 | 双实例环境分别 `service.instance(id).group.info(...)` | 各自返回对应机器人视角的群信息 |
 | 2 | 事件来源 | 双实例各点一次按钮 | 订阅者收到 2 个事件且 `source.platform_id` 不同，各自 ACK |
 | 3 | 禁用实例 | 面板禁用一台后立即调用 | 立即抛 `InstanceUnavailable`，其他实例正常 |
 | 4 | 同 ID 重载 | 重载适配器后用旧长期视图调用 | 正常（跟随同身份重载）；旧事件抛 `StaleSourceEvent` |
 | 5 | 改绑 AppID | 同 ID 改 AppID 后用旧视图 | 抛 `InstanceIdentityChanged` |
 | 6 | 配额共享 | 同 AppID 两实例交替发被动回复 | 第 6 次（群）降级，计数不因重载清零 |
 | 7 | 富消息 | `send_rich` markdown+键盘 | 群内渲染正常 |
-| 8 | 引用回复 | `reference(svc.ref_from_event(event))` | 引用气泡正常（身份前缀隔离） |
+| 8 | 引用回复 | `reference(service.ref_from_event(event))` | 引用气泡正常（身份前缀隔离） |
 | 9 | 沙箱 | Webhook 配置 `is_sandbox` | 该实例身份为 sandbox，与生产实例配额分开 |
 | 10 | intents 拒断 | 未开权限时订阅成员事件 | 仅该实例降级保连，其他实例不受影响 |
 

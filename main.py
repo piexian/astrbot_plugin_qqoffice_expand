@@ -1,13 +1,15 @@
 """astrbot_plugin_qqoffice_expand — QQ 官方机器人扩展能力中台（N 实例版）。
 
-接入方式见 README（get_registered_star 取 star_cls 作为 svc）：
-- svc.instance("qq_sales")：明确配置实例 ID 的主动调用视图（创建时即校验
+接入方式见 README（get_registered_star 取 star_cls 后 get_service）：
+- service = star_cls.get_service(api_version=1)：公开服务门面（SDK v1），
+  提供 get_status()/capabilities()/wait_ready() 与委托入口；
+- service.instance("qq_sales")：明确配置实例 ID 的主动调用视图（创建时即校验
   本体当前实例并固定机器人身份，改绑 AppID 后旧视图明确失败）；
-- svc.for_event(event)：从原生/扩展事件绑定来源的视图（持有事件目标，
+- service.for_event(event)：从原生/扩展事件绑定来源的视图（持有事件目标，
   send_rich 不必再传 event）；
 - 根服务只保留构建器、全局订阅、实例查询与状态，无无来源发送。
 
-注意使用时机：AstrBot 中插件 initialize() 先于平台实例化。svc.instance(id)
+注意使用时机：AstrBot 中插件 initialize() 先于平台实例化。service.instance(id)
 要求该平台已在运行索引中；依赖方应在收到 on_plugin_loaded 广播且平台已
 就绪后创建视图（或先订阅事件、在事件回调里 for_event）。
 """
@@ -35,6 +37,11 @@ from .core.events import (
     EventBus,
     QQOfficeEvent,
 )
+from .core.plugin_service import (
+    SERVICE_API_VERSION,
+    PluginServiceError,
+    QQOfficeService,
+)
 from .core.ratelimit import RateLimiter
 from .core.refstore import RefStore
 from .core.registry import Registry, collect_methods
@@ -60,7 +67,9 @@ class Main(Star):
         self.event_bus = EventBus(self.config, logger)
         self.refstore: RefStore | None = None
         self._coordinator: asyncio.Task | None = None
-        self._ready_flag = False
+        # 公开门面：构造后即可获取（state=initializing），生命周期见
+        # core/plugin_service.py；旧 ready/status/wait_ready 由它驱动。
+        self._service = QQOfficeService(self)
         self.patcher: AdapterPatcher | None = None
         self.routes: RouteCore | None = None
         self.states: RobotStates | None = None
@@ -78,6 +87,14 @@ class Main(Star):
     # ---------------- 生命周期 ----------------
 
     async def initialize(self) -> None:
+        try:
+            await self._initialize()
+        except BaseException:
+            self._service.mark_unavailable("initialize_failed")
+            raise
+        self._service.mark_ready()
+
+    async def _initialize(self) -> None:
         cfg = self.config
         try:
             data_dir = StarTools.get_data_dir(PLUGIN_NAME)
@@ -112,14 +129,19 @@ class Main(Star):
 
         self.patcher.refresh()          # 已在运行的实例立即挂载（含热安装重载）
         self._coordinator = asyncio.create_task(self._coordinator_loop())
-        self._ready_flag = True
         logger.info(
             f"[qqoffice_expand] 加载完成（N 实例路由）：当前实例 "
             f"{sorted(self.routes.routes)}，命名方法 {len(self.registry.names())} 个"
         )
 
     async def terminate(self) -> None:
-        self._ready_flag = False
+        self._service.mark_closing()   # 一开始拒绝新业务（门面与旧入口一致）
+        try:
+            await self._terminate()
+        finally:
+            self._service.mark_closed()   # 旧服务永久失效；get_status 仍可查询
+
+    async def _terminate(self) -> None:
         if self.routes is not None:
             self.routes.deactivate()   # 先拒绝新请求与在途核验，不触碰本体资源
         if self._coordinator and not self._coordinator.done():
@@ -225,7 +247,20 @@ class Main(Star):
             if state.idle():
                 self.states.discard(state.key)
 
-    # ---------------- 订阅 / 目录 / 状态 ----------------
+    # ---------------- 公开门面 / 订阅 / 目录 / 状态 ----------------
+
+    def get_service(self, api_version: int = 1) -> QQOfficeService:
+        """获取公开服务门面（SDK v1）。
+
+        同步方法；同次加载返回同一服务对象；未配置或初始化中也可获取并
+        查询状态。仅接受真正的 int 1（不接受 bool）；不支持时抛
+        PluginServiceError(code="unsupported_version")。
+        """
+        if type(api_version) is not int or api_version != SERVICE_API_VERSION:
+            raise PluginServiceError(
+                "unsupported_version", "仅支持 QQ 官方扩展服务接口 v1"
+            )
+        return self._service
 
     def on(self, event_type: str, handler) -> Callable:
         """全局订阅：接收全部实例的该事件。返回解绑闭包。"""
@@ -240,14 +275,20 @@ class Main(Star):
 
     @property
     def ready(self) -> bool:
-        return self._ready_flag
+        """兼容入口：根服务是否就绪（与 service.get_status()["ready"] 一致）。"""
+        return self._service.state == "ready"
 
     def _log(self, level: str, msg: str) -> None:
         getattr(logger, level)(f"[qqoffice_expand] {msg}")
 
     async def wait_ready(self, timeout: float = 60.0) -> bool:
+        """兼容入口：就绪返回 True，超时返回 False（不抛错）。
+
+        新接入请用 get_service(api_version=1).wait_ready()（协议化：返回
+        状态快照或抛 TimeoutError / service_closed）。
+        """
         deadline = asyncio.get_running_loop().time() + timeout
-        while not self._ready_flag:
+        while self._service.state != "ready":
             if asyncio.get_running_loop().time() >= deadline:
                 return False
             await asyncio.sleep(0.05)
