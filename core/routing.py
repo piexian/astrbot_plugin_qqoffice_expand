@@ -147,7 +147,7 @@ class PassiveWindows:
     LIMITS = {"group": (300.0, 5), "c2c": (3600.0, 4)}
 
     def __init__(self):
-        # (scene, target, msg_id) -> [first_ts, count, last_ts, version]；保留插入序。
+        # (scene, target, msg_id) -> [first_ts, count, last_ts, version, seq]。
         self._records: OrderedDict[tuple, list] = OrderedDict()
         self._queues: dict[str, list[tuple[float, int, tuple]]] = {}  # scene -> 堆
         self._rotate = 0   # 跨调用 scene 轮转指针（预算公平）
@@ -165,7 +165,7 @@ class PassiveWindows:
         rec = self._records.get(self._key(scene, target, msg_id))
         if rec is None:
             return True, ""
-        first_ts, count, last_ts, _ = rec
+        first_ts, count, last_ts = rec[:3]
         now = time.monotonic()
         if now - first_ts > window:
             return False, "窗口已过期"
@@ -187,13 +187,23 @@ class PassiveWindows:
             return False, f"已达被动回复上限（{max_count} 次）"
         if rec is None:
             self._version += 1
-            self._records[key] = [now, 1, now, self._version]
+            self._records[key] = [now, 1, now, self._version, 0]
             heapq.heappush(self._queues.setdefault(scene, []), (now + window, self._version, key))
         else:
             rec[1] += 1
             rec[2] = now
             self._records.move_to_end(key)
         return True, ""
+
+    def next_seq(
+        self, scene: str, target: str | None, msg_id: str, explicit: int | None = None
+    ) -> int:
+        """同一回复键单调分配序号；退额度不退序号。"""
+        rec = self._records[self._key(scene, target, msg_id)]
+        previous = rec[4]
+        value = explicit if explicit is not None else previous + 1
+        rec[4] = max(previous, value)
+        return value
 
     def release(self, scene: str, target: str | None, msg_id: str) -> None:
         """发送前确定性失败：释放一次预留（不回收已过期的清理键）。"""

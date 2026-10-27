@@ -29,7 +29,7 @@ __平台支持__: 仅 QQ 官方机器人适配器（`qq_official` websocket 模�
 - 频道管理 - 频道与子频道、成员、身份组、权限、禁言、消息与私信、公告、精华、日程、表情表态、音频、论坛和接口授权
 - [接口覆盖与调用示例](docs/API_COVERAGE.md)
 - `send_rich` 富消息 - markdown + 按钮键盘 + 引用回复，上传与发送在同一操作上下文完成（中途重载不跨代次发送）
-- 通用 `call()` 通道（视图方法）- 任意官方端点：频控令牌桶、主动消息配额、无状态 msg_seq、被动窗口自动降级、token/频控自动重试（重试前核验同一来源）、HTML 网关页识别、错误码 → 排查建议
+- 通用 `call()` 通道（视图方法）- 任意官方端点：频控令牌桶、主动消息配额、按回复键递增 msg_seq、被动窗口自动降级、token/频控自动重试（重试前核验同一来源）、HTML 网关页识别、错误码 → 排查建议
 - 扩展事件订阅 - 全局与实例作用域两级；事件携带不可变来源；按钮/快捷菜单 3 秒时限自动应答（按来源机器人、同 id 一次）
 - REFIDX 引用索引 - 按机器人身份命名空间持久化（全局容量上限，不随实例数增长）
 - 诊断指令 `/qqoffice_status` - 实例/身份/挂载/订阅/频控状态一览
@@ -50,11 +50,21 @@ __平台支持__: 仅 QQ 官方机器人适配器（`qq_official` websocket 模�
 | `certified_bots` | template_list | [] | 按机器人 AppID 覆盖认证限额（每条 appid + certified）；同身份多实例只读一份，未列出的用全局默认 |
 | `auto_degrade_proactive` | bool | true | 被动回复窗口超窗/超次时自动降级为主动消息；关闭后直接抛错 |
 | `dot_replace` | bool | false | 群聊文本点号替换，规避 40054010 误拦；默认关闭 |
-| `interaction_auto_ack` | bool | true | 仅按钮/快捷菜单（type=11/12）按来源机器人在 3 秒内自动应答 |
+| `interaction_auto_ack` | bool | true | type=11/12 自动 code=0 应答；自定义结果应关闭，重复手动 ACK 抛 `QQOfficeDuplicateAck` |
+| `event_handler_concurrency` | int | 16 | 普通订阅回调并发上限，ACK 独立运行 |
+| `event_queue_size` | int | 1024 | 待执行回调上限；满时拒绝新增并计数 |
+| `event_handler_timeout` | float | 30.0 | 单个异步回调超时秒数，超时取消并计数 |
+| `interaction_ack_concurrency` | int | 128 | 自动 ACK 任务上限，满时跳过新增并计数 |
 | `enable_group_member_events` | bool | true | 订阅群成员进出事件（intent 1<<24）；修改后需重载适配器生效 |
 | `ref_ttl_days` | int | 7 | 引用索引本地留存天数；0 表示不落盘 |
 | `ref_max_entries` | int | 50000 | 引用索引全插件容量上限（不随实例数增长） |
 | `retry_max` | int | 3 | 频控自动等待重试上限；401/11244 token 重试固定 1 次 |
+
+群/C2C 发送序号由同身份实例共享，明确失败只退额度、不回收序号；显式 `msg_seq` 保留，流式续片沿用首片序号。有效窗口内同一互动只允许一个自动或手动 ACK；明确拒绝可重答，未知结果保留去重。
+
+事件状态含 `active_handlers`、`queued_handlers`、`dropped_handlers`、`handler_timeouts`、`pending_acks` 和 `dropped_acks`。回调需要正常传播取消；同步阻塞回调无法由异步超时中断。
+
+插件合并同一 botpy Token 对象的过期及 401 刷新，不合并不同适配器的 Token；重载共享响应捕获状态，卸载按所有权恢复补丁并等待已有刷新结束。
 
 > 注：旧版本的 `prefer_new_domain` / `sandbox` 全局域名开关已移除。域名与环境由每个适配器自身的配置决定（Webhook 的 `is_sandbox`；生产新旧域名别名不构成不同机器人身份）。
 

@@ -81,6 +81,8 @@ AstrBot 基线已有 `send_streaming(generator)`，使用 `/messages` 上的旧 
 
 `INTERACTION_CREATE` 完整保留消息反馈、授权、切换模型等字段。自动应答只针对 type=11/12；其余事件仍分发，按需由调用方通过 `manage.interaction_ack` 应答。[互动事件](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/interaction_create.html)、[响应接口](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/interactions_interaction_id.put.html)。按钮二次确认用 `svc.btn(..., modal={...})`，字段进入 `action.modal`；分组标识可通过 `group_id` 传入。
 
+自动和手动应答共用资格，重复调用抛 `QQOfficeDuplicateAck`；需要自定义 code 时关闭 `interaction_auto_ack`。明确拒绝释放资格，未知结果保留去重。
+
 ## 事件补丁与边界
 
 - QQ 群加入、退出、申请事件的 `member_openid` 会归一到 `ev.member_openid`。

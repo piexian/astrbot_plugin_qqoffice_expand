@@ -21,9 +21,13 @@ from __future__ import annotations
 
 import asyncio
 import time
+import inspect
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .ack import AckReservation
+from .errors import QQOfficeDuplicateAck
 from .routing import EventSource, RouteCore
 
 _RAW_EVENT: "object | None" = None  # 延迟创建的 ContextVar，见 _raw_event()
@@ -267,6 +271,22 @@ class EventBus:
         self._scoped_any: dict[tuple[str, str], list[Callable]] = {}    # (pid, appid)
         self._scoped_bits: dict[tuple[str, str], int] = {}  # (pid, prefix) -> 按需位缓存
         self._tasks: set[asyncio.Task] = set()
+        self._workers: set[asyncio.Task] = set()
+        self._queue: deque[tuple[Callable, QQOfficeEvent]] = deque()
+        self._handler_concurrency = max(
+            1, int(self.config.get("event_handler_concurrency", 16))
+        )
+        self._queue_size = max(1, int(self.config.get("event_queue_size", 1024)))
+        self._handler_timeout = max(
+            0.001, float(self.config.get("event_handler_timeout", 30.0))
+        )
+        self._ack_limit = max(
+            1, int(self.config.get("interaction_ack_concurrency", 128))
+        )
+        self._ack_pending = 0
+        self.dropped_handlers = 0
+        self.dropped_acks = 0
+        self.handler_timeouts = 0
         self._ack_caller: Callable[[Any, str], Any] | None = None  # (view, iid)
         self._routes: RouteCore | None = None
         self._stopping = False   # 卸载后不再投递/应答
@@ -274,16 +294,17 @@ class EventBus:
         self.auto_ack_total = 0
 
     async def stop(self) -> None:
-        """卸载：停用投递并取消/等待本插件拥有的任务。"""
+        """停止排队任务；回调内卸载时不取消或等待自身。"""
         self._stopping = True
-        tasks = [t for t in self._tasks if not t.done()]
+        self._queue.clear()
+        current = asyncio.current_task()
+        tasks = [t for t in self._tasks if not t.done() and t is not current]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        self._tasks.clear()
-        self.counts: dict[str, int] = {}
-        self.auto_ack_total = 0
+        self._tasks.difference_update(tasks)
+        self._workers.difference_update(tasks)
 
     # -- 订阅 --
 
@@ -403,14 +424,53 @@ class EventBus:
                 (source.platform_id, source.robot_key.prefix()), []
             )
         for handler in handlers:
-            task = asyncio.create_task(self._safe_call(handler, ev))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            self._enqueue_handler(handler, ev)
+
+    def _track_task(self, task: asyncio.Task) -> None:
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def _enqueue_handler(self, handler, ev: QQOfficeEvent) -> None:
+        self._workers.difference_update(t for t in list(self._workers) if t.done())
+        if len(self._workers) < self._handler_concurrency:
+            task = asyncio.create_task(self._worker((handler, ev)))
+            self._workers.add(task)
+            task.add_done_callback(self._worker_done)
+            self._track_task(task)
+        elif len(self._queue) < self._queue_size:
+            self._queue.append((handler, ev))
+        else:
+            self.dropped_handlers += 1
+            if self.logger and self.dropped_handlers == 1:
+                self.logger.warning("[qqoffice_expand] 事件队列已满，拒绝新增处理回调")
+
+    def _worker_done(self, task: asyncio.Task) -> None:
+        self._workers.discard(task)
+        if (
+            not self._stopping
+            and self._queue
+            and len(self._workers) < self._handler_concurrency
+        ):
+            self._enqueue_handler(*self._queue.popleft())
+
+    async def _worker(self, job) -> None:
+        while not self._stopping:
+            handler, ev = job
+            try:
+                async with asyncio.timeout(self._handler_timeout):
+                    await self._safe_call(handler, ev)
+            except TimeoutError:
+                self.handler_timeouts += 1
+                if self.logger:
+                    self.logger.error(f"[qqoffice_expand] 事件处理器超时 ({ev.type})")
+            if self._stopping or not self._queue:
+                return
+            job = self._queue.popleft()
 
     async def _safe_call(self, handler, ev: QQOfficeEvent) -> None:
         try:
             result = handler(ev)
-            if asyncio.iscoroutine(result):
+            if inspect.isawaitable(result):
                 await result
         except asyncio.CancelledError:
             raise
@@ -441,56 +501,38 @@ class EventBus:
                 )
             return
         state = self._routes.state_for(source.robot_key)
+        iid = str(iid)
+        if self._ack_pending >= self._ack_limit:
+            self.dropped_acks += 1
+            if self.logger and self.dropped_acks == 1:
+                self.logger.warning("[qqoffice_expand] 自动 ACK 并发已满，跳过新增应答")
+            return
+        try:
+            phase = AckReservation(state, iid)
+        except QQOfficeDuplicateAck:
+            return
+        self._ack_pending += 1
 
         async def _do_ack():
-            if state.acks.try_reserve(str(iid)) != "new":
-                return  # 已应答过 / 并发重复
             try:
                 view = _make_source_view(self._routes, source)
+                await asyncio.wait_for(self._ack_caller(view, iid, phase), timeout=2.5)
             except asyncio.CancelledError:
-                state.acks.release(str(iid))   # 未发送，回收资格
-                raise
-            except Exception as exc:   # 源视图构造失败 = 确定未发送
-                state.acks.release(str(iid))
-                if self.logger:
-                    self.logger.error(f"[qqoffice_expand] 互动应答失败: {exc!r}")
-                return
-            phase = _AckPhase()
-            try:
-                await asyncio.wait_for(
-                    self._ack_caller(view, str(iid), phase), timeout=2.5
-                )
-            except asyncio.TimeoutError:
-                # 超时按已应答处理（settle_unknown）：不能清除后重答同一 id。
-                if not phase.reached_sdk:
-                    state.acks.release(str(iid))   # 尚未发出：可重答
-                else:
-                    state.acks.settle_unknown(str(iid))
-                if self.logger:
-                    self.logger.error(f"[qqoffice_expand] 互动应答超时（3 秒时限）: {iid}")
-            except asyncio.CancelledError:
-                if phase.definitive_rejected or not phase.reached_sdk:
-                    state.acks.release(str(iid))   # 明确拒绝或未发送：可重答
-                else:
-                    state.acks.settle_unknown(str(iid))   # 结果未知：保留
                 raise
             except Exception as exc:
-                if phase.definitive_rejected or not phase.reached_sdk:
-                    state.acks.release(str(iid))   # 明确拒绝或未发送：可重答
-                else:
-                    state.acks.settle_unknown(str(iid))   # 结果未知：保留
                 if self.logger:
                     self.logger.error(f"[qqoffice_expand] 互动应答失败: {exc!r}")
             else:
-                if phase.reached_sdk and phase.unknown:
-                    state.acks.settle_unknown(str(iid))
-                else:
-                    state.acks.succeed(str(iid))
-                    self.auto_ack_total += 1
+                phase.finish(success=True)
+                self.auto_ack_total += 1
+
+        def _done(task):
+            phase.finish()
+            self._ack_pending -= 1
 
         task = asyncio.create_task(_do_ack())
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._track_task(task)
+        task.add_done_callback(_done)
 
     def status(self) -> dict:
         return {
@@ -499,27 +541,25 @@ class EventBus:
             "any_subscribers": len(self._any),
             "scoped_subscribers": {
                 f"{pid}|{appid}:{evt}": len(v)
-                for (pid, appid, evt), v in self._scoped.items() if v
+                for (pid, appid, evt), v in self._scoped.items()
+                if v
             },
             "scoped_any_subscribers": {
-                f"{pid}|{appid}": len(v) for (pid, appid), v in self._scoped_any.items() if v
+                f"{pid}|{appid}": len(v)
+                for (pid, appid), v in self._scoped_any.items()
+                if v
             },
             "counts": dict(self.counts),
             "auto_acked": self.auto_ack_total,
+            "active_handlers": sum(not task.done() for task in self._workers),
+            "queued_handlers": len(self._queue),
+            "dropped_handlers": self.dropped_handlers,
+            "handler_timeouts": self.handler_timeouts,
+            "pending_acks": self._ack_pending,
+            "dropped_acks": self.dropped_acks,
         }
 
 
-class _AckPhase:
-    """一次自动 ACK 的阶段跟踪：由发送通道按实际阶段置位。
-
-    reached_sdk：已进入 SDK（结果可能生效）；unknown：结果未知（网关/超时）；
-    definitive_rejected：官方明确拒绝（确定未生效，可重答）。
-    """
-
-    def __init__(self):
-        self.reached_sdk = False
-        self.unknown = False
-        self.definitive_rejected = False
 
 
 def _make_source_view(routes: RouteCore, source: EventSource):

@@ -24,8 +24,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import errors as qo_errors
+from .ack import AckReservation
 from .errors import QQOfficeAPIError, QQOfficeGatewayError, QQOfficeNotSupported
 from .http_capture import capture_response_status
+from .token_guard import refresh_access_token, token_snapshot
 from .routing import (
     BoundSource,
     OperationContext,
@@ -41,7 +43,7 @@ _DOT_RE = _re.compile(r"([A-Za-z0-9\u4e00-\u9fff])\.([A-Za-z0-9\u4e00-\u9fff])")
 
 
 def generate_msg_seq() -> int:
-    """无状态生成，规避相同 msg_id+msg_seq 的平台去重报错。"""
+    """兼容序号生成器；实际发送按回复键递增。"""
     return (int(time.time() * 1000) % 100_000_000) ^ random.getrandbits(16)
 
 
@@ -187,6 +189,8 @@ async def _execute_call_body(svc, routes, bound, ctx, route, state, method,
                 continue
             payload[key] = kwargs[key]
 
+    if payload.get("msg_seq") is not None and type(payload["msg_seq"]) is not int:
+        raise QQOfficeNotSupported("msg_seq 必须为整数")
     # —— 被动窗口预留（无 await；群/C2C 按身份+scene+target+msg_id 隔离）——
     reservation: _Reservation | None = None
     degraded_from = None
@@ -197,6 +201,9 @@ async def _execute_call_body(svc, routes, bound, ctx, route, state, method,
                 40034128, f"流式被动回复窗口失效（{reason}），请显式发起主动流"
             )
         reservation = _Reservation(state.windows, "c2c", target, payload["msg_id"])
+        payload["msg_seq"] = state.windows.next_seq(
+            "c2c", target, payload["msg_id"], payload.get("msg_seq")
+        )
     elif is_send and not continuation:
         msg_id = payload.get("msg_id")
         if msg_id and scene in PassiveWindows.LIMITS:
@@ -211,12 +218,16 @@ async def _execute_call_body(svc, routes, bound, ctx, route, state, method,
                 payload.pop("msg_seq", None)
             else:
                 reservation = _Reservation(state.windows, scene, target, msg_id)
-                if "msg_seq" not in payload:
-                    payload["msg_seq"] = (
-                        kwargs.get("msg_seq") if kwargs.get("msg_seq") is not None
-                        else generate_msg_seq()
-                    )
+                payload["msg_seq"] = state.windows.next_seq(
+                    scene, target, msg_id, payload.get("msg_seq")
+                )
 
+    ack = None
+    if method == "PUT" and _re.fullmatch(r"/interactions/[^/]+", full_path):
+        iid = full_path.rsplit("/", 1)[-1]
+        ack = phase if isinstance(phase, AckReservation) else AckReservation(state, iid)
+        ack.claim(state, iid)
+        phase = ack
     _reached_sdk = False
     _last_definitive = False   # 最近一次响应是官方明确拒绝（确定未生效）
     try:
@@ -246,6 +257,15 @@ async def _execute_call_body(svc, routes, bound, ctx, route, state, method,
         retry_max = int(svc.config.get("retry_max", 3) or 0)
         while True:
             try:
+                rejected_token = getattr(http, "_token", None)
+                check_token = getattr(rejected_token, "check_token", None)
+                if callable(check_token):
+                    await check_token()
+                    current = routes.check_context(ctx)
+                    if current is not http:
+                        http = current
+                        continue
+                rejected_snapshot = token_snapshot(rejected_token)
                 _reached_sdk = True   # 即将进入 SDK（http.request）
                 _last_definitive = False   # 新尝试开始：上一次的明确拒绝不再代表本次
                 if phase is not None:
@@ -261,7 +281,9 @@ async def _execute_call_body(svc, routes, bound, ctx, route, state, method,
                 if (not token_retry_used
                         and (exc.code == 401 or exc.code in qo_errors.TOKEN_EXPIRED_CODES)):
                     token_retry_used = True
-                    http = await _refresh_token(routes, ctx)
+                    http = await _refresh_token(
+                        routes, ctx, rejected_token, rejected_snapshot
+                    )
                     continue
                 if (exc.code == 429 or exc.code in qo_errors.RATE_LIMITED_CODES
                         or (is_stream and exc.code == 50002)):
@@ -295,7 +317,12 @@ async def _execute_call_body(svc, routes, bound, ctx, route, state, method,
         # 其余取消/未知异常结果可能已生效 → 保留消费。
         if not _reached_sdk or _last_definitive:
             _fail(reservation)
+        if ack is not None:
+            ack.finish()
         raise
+
+    if ack is not None:
+        ack.finish(success=True)
 
     # —— 出站引用入库（带身份前缀）；预留默认归宿为已消耗 ——
     if isinstance(result, dict) and is_send and scene and target:
@@ -338,7 +365,13 @@ async def _dispatch(http, method: str, full_path: str, params: dict | None,
         with capture_response_status(botpy_http) as captured:
             result = await http.request(route, retry_time=sdk_retry_time, **kwargs)
     except Exception as exc:
-        err = captured.get("error") or qo_errors.from_exception(exc)
+        if captured.get("body") is not None:
+            # 跨重载 wrapper 的异常类属于旧模块，使用原响应重新标准化。
+            err = qo_errors.from_http_response(
+                captured["status"], captured["body"], captured.get("headers")
+            )
+        else:
+            err = captured.get("error") or qo_errors.from_exception(exc)
         if err is None:
             raise
         raise err from exc
@@ -358,13 +391,19 @@ def _record_error(state: RobotState, exc: Exception) -> None:
     )
 
 
-async def _refresh_token(routes: RouteCore, ctx: OperationContext) -> Any:
-    """401/11244 后换 token 并核验代次；返回当前可用的 HTTP。"""
+async def _refresh_token(
+    routes: RouteCore, ctx: OperationContext, rejected_token=None, expected=None
+) -> Any:
+    """合并同一凭证代次的刷新，等待后核验来源。"""
     http = routes.check_context(ctx)
     token = getattr(http, "_token", None)
+    if rejected_token is not None and token is not rejected_token:
+        return http
     if token is not None and hasattr(token, "update_access_token"):
         try:
-            await token.update_access_token()
+            handled = await refresh_access_token(token, expected=expected)
+            if not handled:
+                await token.update_access_token()
         except Exception:
             pass   # 刷新失败交由下一次请求的 botpy 自动机制兜底
     return routes.check_context(ctx)

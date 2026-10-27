@@ -16,6 +16,7 @@ __all__ = [
     "QQOfficeNotSupported",
     "QQOfficeGatewayError",
     "UploadDailyLimitExceeded",
+    "QQOfficeDuplicateAck",
     "QQOfficeRoutingError",
     "InstanceUnavailable",
     "InstanceIdentityChanged",
@@ -98,6 +99,10 @@ class QQOfficeAPIError(QQOfficeError):
         if self.advice:
             text += f"（建议：{self.advice}）"
         super().__init__(text)
+
+class QQOfficeDuplicateAck(QQOfficeError):
+    """同一互动已经预留或应答，拒绝再次发送。"""
+
 
 class QQOfficeNotSupported(QQOfficeError):
     """当前平台/场景不支持该能力，调用方应据此降级。"""
