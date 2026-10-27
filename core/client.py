@@ -37,7 +37,9 @@ from .routing import (
 )
 
 __all__ = ["generate_msg_seq", "resolve_endpoint_key", "execute_call",
-           "send_rich_bound", "upload_media_bound"]
+           "send_rich_bound", "upload_media_bound", "material_upload_bound"]
+
+DIRECT_UPLOAD_LIMIT = 5 * 1024 * 1024   # 官方 file_data 二进制直传上限，超过走分片
 
 _DOT_RE = _re.compile(r"([A-Za-z0-9\u4e00-\u9fff])\.([A-Za-z0-9\u4e00-\u9fff])")
 
@@ -532,6 +534,18 @@ async def _upload_shared(svc, ctx: OperationContext, route, state: RobotState,
         cached = refstore.get_file_info(f"{prefix}|{chash}", scene, openid, file_type)
         if cached and not srv_send_msg:
             return {"file_info": cached, "cached": True}
+        if len(data) > DIRECT_UPLOAD_LIMIT:
+            # file_data 直传官方上限 5M；大文件自动走分片链路（file_name 必填）
+            resp = await _upload_chunked(
+                svc, ctx, scene, openid, data, file_type, up.filename, srv_send_msg,
+            )
+            file_info = str(resp.get("file_info") or "")
+            if file_info:
+                refstore.cache_file_info(
+                    f"{prefix}|{chash}", scene, openid, file_type, file_info,
+                    float(resp.get("ttl") or 0),
+                )
+            return resp
 
     path = f"/v2/{'groups' if scene == 'group' else 'users'}/{{openid}}/files"
     if up.kind == "url":
@@ -540,6 +554,7 @@ async def _upload_shared(svc, ctx: OperationContext, route, state: RobotState,
         body = {
             "file_type": file_type,
             "file_data": base64.b64encode(data).decode(),
+            "file_name": up.filename,
             "srv_send_msg": srv_send_msg,
         }
     resp = await execute_call(
@@ -555,3 +570,96 @@ async def _upload_shared(svc, ctx: OperationContext, route, state: RobotState,
             float(resp.get("ttl") or 0),
         )
     return resp
+
+
+async def _upload_chunked(svc, ctx: OperationContext, scene: str, openid: str,
+                          data: bytes, file_type: int, file_name: str,
+                          srv_send_msg: bool) -> dict:
+    """大文件自动分片：upload_prepare → 预签名 PUT → part_finish → files 合并。
+
+    分片 md5 按本地计算（COS ETag 与之一致）；PUT 失败抛网关错误，不重放。
+    """
+    import hashlib
+
+    from .media import presigned_put, upload_digests
+
+    prefix = "groups" if scene == "group" else "users"
+    base = f"/v2/{prefix}/{{openid}}"
+    md5, sha1, md5_10m = upload_digests(data)
+    prep = await execute_call(
+        svc, None, "POST", f"{base}/upload_prepare",
+        path_params={"openid": openid},
+        json={"file_type": file_type, "file_size": str(len(data)),
+              "file_name": file_name, "md5": md5, "sha1": sha1, "md5_10m": md5_10m},
+        scene=scene, target_openid=openid, endpoint_key=f"{scene}.upload_prepare",
+        _ctx=ctx,
+    )
+    upload_id = str(prep.get("upload_id") or "")
+    parts = prep.get("parts") or []
+    if not upload_id or not parts:
+        raise QQOfficeAPIError(-1, f"upload_prepare 响应缺少 upload_id/parts: {sorted(prep)}")
+    default_block = int(prep.get("block_size") or 0)
+    offset = 0
+    for part in parts:
+        presigned = str(part.get("presigned_url") or "")
+        block = int(part.get("block_size") or default_block or 0)
+        if not presigned or block <= 0:
+            raise QQOfficeAPIError(-1, f"upload_prepare 分片信息不完整: {part}")
+        chunk = data[offset:offset + block]
+        offset += len(chunk)
+        await presigned_put(presigned, chunk)
+        await execute_call(
+            svc, None, "POST", f"{base}/upload_part_finish",
+            path_params={"openid": openid},
+            json={"upload_id": upload_id, "part_index": int(part.get("index", 0)),
+                  "block_size": str(len(chunk)),
+                  "md5": hashlib.md5(chunk).hexdigest()},
+            scene=scene, target_openid=openid,
+            endpoint_key=f"{scene}.upload_part_finish", _ctx=ctx,
+        )
+    return await execute_call(
+        svc, None, "POST", f"{base}/files",
+        path_params={"openid": openid},
+        json={"upload_id": upload_id, "file_type": file_type,
+              "file_name": file_name, "srv_send_msg": srv_send_msg},
+        scene=scene, target_openid=openid, endpoint_key=f"{scene}.files", _ctx=ctx,
+    )
+
+
+async def material_upload_bound(svc, bound: BoundSource, source) -> dict:
+    """素材图片一步上传：prepare → 预签名 PUT → complete，返回 qqbot-media:// 引用。
+
+    上限 10MB、png/jpeg/gif/webp、单机器人 100 张；引用见 docs 素材管理页。
+    """
+    from .media import image_content_type, presigned_put, to_uploadable, upload_digests
+
+    routes: RouteCore = svc.routes
+    route, _http = routes.resolve(bound)
+    ctx = routes.operation(route)
+
+    up = to_uploadable(source)
+    if up.is_url:
+        raise QQOfficeAPIError(-1, "素材上传仅接受本地图片；公网 URL 图片可在 Markdown 中直接引用")
+    data = await up.load_bytes()
+    routes.check_context(ctx)
+    if len(data) > 10 * 1024 * 1024:
+        raise QQOfficeAPIError(-1, f"素材图片超 10MB 上限: {len(data)} 字节")
+    content_type = image_content_type(up.filename, up.mime)
+    md5, sha1, _ = upload_digests(data)
+
+    prep = await execute_call(
+        svc, bound, "POST", "/v2/media-images/prepare",
+        json={"file_name": up.filename, "file_size": len(data),
+              "content_type": content_type, "md5": md5, "sha1": sha1},
+        endpoint_key="material.api", _ctx=ctx,
+    )
+    upload_id = str(prep.get("upload_id") or "")
+    presigned = str(prep.get("presigned_url") or "")
+    if not upload_id or not presigned:
+        raise QQOfficeAPIError(-1, f"prepare 响应缺少 upload_id/presigned_url: {sorted(prep)}")
+    etag = await presigned_put(presigned, data, content_type)
+    return await execute_call(
+        svc, bound, "POST", "/v2/media-images/complete",
+        json={"upload_id": upload_id, "md5": etag or md5},
+        endpoint_key="material.api", _ctx=ctx,
+    )

@@ -29,7 +29,7 @@ from .api.guild import GuildAPI
 from .api.manage import ManageAPI
 from .core import builders
 from .core.auth import ADAPTER_NAMES
-from .core.client import execute_call, send_rich_bound, upload_media_bound
+from .core.client import execute_call, send_rich_bound, upload_media_bound, material_upload_bound
 from .core.errors import QQOfficeNotSupported, QQOfficeRoutingError
 from .core.events import (
     EVENT_ID_SCOPES,
@@ -575,6 +575,11 @@ class BoundView:
         return await upload_media_bound(
             self._svc, self._bound, scene, openid, source, file_type, srv_send_msg
         )
+
+    async def material_upload(self, source) -> dict:
+        """素材图片一步上传（bot 级），返回 qqbot-media:// Markdown 引用。"""
+        self._ensure_identity()
+        return await material_upload_bound(self._svc, self._bound, source)
 
 
 def _resolve_ext_event_target(

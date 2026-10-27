@@ -16,13 +16,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .errors import QQOfficeAPIError
+from .errors import QQOfficeAPIError, QQOfficeGatewayError
 
 __all__ = [
     "Uploadable",
     "to_uploadable",
     "strip_amr_header",
     "image_size",
+    "upload_digests",
+    "image_content_type",
+    "presigned_put",
 ]
 
 DEFAULT_IMAGE_SIZE = (512, 512)
@@ -94,7 +97,8 @@ def to_uploadable(source, *, filename: str | None = None, mime: str = "") -> Upl
         return source
 
     if isinstance(source, (bytes, bytearray)):
-        return Uploadable("bytes", bytes(source), filename or "file.bin", mime, len(source))
+        raw = bytes(source)
+        return Uploadable("bytes", raw, filename or "file.bin", mime, len(raw), _bytes=raw)
 
     if not isinstance(source, str) or not source.strip():
         raise QQOfficeAPIError(-1, f"无法识别的媒体来源: {type(source).__name__}")
@@ -214,3 +218,45 @@ def amr_check(voice_bytes: bytes) -> bytes:
     """同步版 AMR 剥头，供发送语音前调用。"""
     payload, _ = strip_amr_header(voice_bytes)
     return payload
+
+# ---------------- 分片 / 素材上传 ----------------
+
+_MD5_10M_LIMIT = 10002432   # 官方 md5_10m 取前 10002432 字节（约 10MB）
+
+IMAGE_CONTENT_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_IMAGE_MIME_BY_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                      ".gif": "image/gif", ".webp": "image/webp"}
+
+
+def upload_digests(data: bytes) -> tuple[str, str, str]:
+    """返回 (md5, sha1, md5_10m)：整文件校验值 + 前 10002432 字节 MD5。"""
+    import hashlib
+
+    return (hashlib.md5(data).hexdigest(), hashlib.sha1(data).hexdigest(),
+            hashlib.md5(data[:_MD5_10M_LIMIT]).hexdigest())
+
+
+def image_content_type(filename: str, mime: str = "") -> str:
+    """素材图片 content_type：仅 png/jpeg/gif/webp，无法判定时报错。"""
+    ct = (mime or "").split(";")[0].strip().lower() or _IMAGE_MIME_BY_EXT.get(
+        Path(filename).suffix.lower(), "")
+    if ct not in IMAGE_CONTENT_TYPES:
+        raise QQOfficeAPIError(-1, f"素材图片仅支持 png/jpeg/gif/webp，无法从 {filename!r} 判定类型")
+    return ct
+
+
+async def presigned_put(url: str, data: bytes, content_type: str = "") -> str | None:
+    """PUT 二进制到平台预签名 URL（COS 直传，非 QQ API）。
+
+    返回响应 ETag（去引号，COS 即分片 MD5）；非 2xx 抛 QQOfficeGatewayError。
+    """
+    import aiohttp
+
+    headers = {"Content-Type": content_type} if content_type else {}
+    timeout = aiohttp.ClientTimeout(total=600, connect=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.put(url, data=data, headers=headers) as resp:
+            if not 200 <= resp.status < 300:
+                hint = (await resp.text())[:120]
+                raise QQOfficeGatewayError(resp.status, None, hint)
+            return (resp.headers.get("ETag") or "").strip('"') or None

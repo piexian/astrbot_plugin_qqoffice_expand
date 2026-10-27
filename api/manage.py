@@ -1,4 +1,4 @@
-"""全局管理接口封装：自定义菜单 / 指令面板 / 互动应答。全部为管理动作，无事件依赖。"""
+"""全局管理接口封装：自定义菜单 / 指令面板 / 互动应答 / 素材图片。全部为 bot 级管理动作。"""
 
 from __future__ import annotations
 
@@ -121,3 +121,45 @@ class ManageAPI:
             path_params={"panel_id": panel_id}, json=body,
             endpoint_key="panels.target",
         )
+
+    async def material_prepare(self, file_name: str, file_size: int, content_type: str,
+                               md5: str, sha1: str, *, extra: dict | None = None) -> dict:
+        """申请素材图片上传，返回 upload_id 与预签名 PUT URL（任务 4 小时内有效）。"""
+        body: dict[str, Any] = {"file_name": file_name, "file_size": file_size,
+                                "content_type": content_type, "md5": md5, "sha1": sha1}
+        body.update(extra or {})
+        return await self._client.call(
+            "POST", "/v2/media-images/prepare", json=body, endpoint_key="material.api",
+        )
+
+    async def material_complete(self, upload_id: str, md5: str,
+                                *, extra: dict | None = None) -> dict:
+        """完成素材上传（md5 为 COS ETag/文件 MD5），返回 image_id 与 qqbot-media:// 引用。"""
+        body: dict[str, Any] = {"upload_id": upload_id, "md5": md5}
+        body.update(extra or {})
+        return await self._client.call(
+            "POST", "/v2/media-images/complete", json=body, endpoint_key="material.api",
+        )
+
+    async def material_list(self, *, cursor: str = "", extra: dict | None = None) -> dict:
+        """有效素材图片列表（按上传时间倒序，next_cursor 为空即末页）。"""
+        params: dict[str, Any] = dict(extra or {})
+        if cursor:
+            params["cursor"] = cursor
+        return await self._client.call(
+            "GET", "/v2/media-images", params=params or None, endpoint_key="material.api",
+        )
+
+    async def material_delete(self, image_id: str, *, extra: dict | None = None) -> dict:
+        """删除素材图片并释放配额；已发送消息不受影响。"""
+        return await self._client.call(
+            "DELETE", f"/v2/media-images/{image_id}/delete",
+            json=extra, endpoint_key="material.api",
+        )
+
+    async def material_upload(self, source) -> dict:
+        """素材图片一步上传（本地文件/bytes/base64）：prepare→PUT→complete。
+
+        返回 {image_id, url(qqbot-media://), ttl, preview_url}。
+        """
+        return await self._client.material_upload(source)

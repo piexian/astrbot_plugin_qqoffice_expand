@@ -19,7 +19,8 @@ from api.c2c import C2CAPI
 from api.group import GroupAPI
 from api.guild import GuildAPI
 from core.builders import btn
-from core.client import generate_msg_seq, resolve_endpoint_key, execute_call
+from core.client import (generate_msg_seq, resolve_endpoint_key, execute_call,
+                         upload_media_bound, material_upload_bound)
 from core.errors import QQOfficeAPIError, QQOfficeGatewayError
 from core.events import AdapterPatcher, EVENT_SPECS, EventBus, normalize_event, _PLUGIN_INTENT_BITS
 from core.ratelimit import ENDPOINT_LIMITS, RateLimiter, _ProactiveQuota
@@ -450,6 +451,117 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rs.get_inbound("APP2@production|group", "G1", "M1"), "REFIDX_b")
         self.assertEqual(rs._file_cache_max, 512)   # 全插件上限，不乘以实例数
 
+
+    async def test_direct_upload_carries_file_name(self):
+        svc = RecordingSvc()
+        svc.add("a", "APP1")
+        http = svc.http_of("a")
+        http.response = {"file_info": "FI1", "ttl": 60}
+        bound = view_for(svc, "a")._bound
+        png = b"\x89PNG\r\n\x1a\n" + b"d" * 64
+        resp = await upload_media_bound(svc, bound, "group", "G1", png, 4, False)
+        method, path, kwargs = http.requests[-1]
+        self.assertEqual((method, path), ("POST", "/v2/groups/G1/files"))
+        self.assertEqual(kwargs["json"]["file_name"], "file.bin")
+        self.assertNotIn("url", kwargs["json"])
+        self.assertEqual(resp["file_info"], "FI1")
+
+    async def test_oversize_upload_falls_back_to_chunked(self):
+        import hashlib as _h
+
+        svc = RecordingSvc()
+        svc.add("a", "APP1")
+        http = svc.http_of("a")
+        data = b"\0" * (5 * 1024 * 1024 + 1)
+        http.response = {"upload_id": "U1", "block_size": "4194304",
+                         "parts": [{"index": 0, "presigned_url": "https://cos/0",
+                                    "block_size": "4194304"},
+                                   {"index": 1, "presigned_url": "https://cos/1",
+                                    "block_size": "1048577"}],
+                         "file_info": "FCHUNK", "ttl": 90}
+        bound = view_for(svc, "a")._bound
+        with patch("core.media.presigned_put", new=AsyncMock(return_value="e")) as put:
+            resp = await upload_media_bound(svc, bound, "c2c", "U9", data, 4, False)
+        self.assertEqual(resp["file_info"], "FCHUNK")
+        self.assertEqual(put.await_count, 2)
+        self.assertEqual(len(put.await_args_list[1].args[1]), 1048577)
+        prep = http.requests[0]
+        self.assertEqual(prep[1], "/v2/users/U9/upload_prepare")
+        self.assertEqual(prep[2]["json"]["file_name"], "file.bin")
+        self.assertEqual(prep[2]["json"]["md5_10m"], _h.md5(data[:10002432]).hexdigest())
+        part = http.requests[1]
+        self.assertEqual(part[1], "/v2/users/U9/upload_part_finish")
+        self.assertEqual(part[2]["json"]["md5"], _h.md5(data[:4194304]).hexdigest())
+        merge = http.requests[-1]
+        self.assertEqual(merge[1], "/v2/users/U9/files")
+        self.assertEqual(merge[2]["json"],
+                         {"upload_id": "U1", "file_type": 4, "file_name": "file.bin",
+                          "srv_send_msg": False})
+        calls_before = len(http.requests)
+        again = await upload_media_bound(svc, bound, "c2c", "U9", data, 4, False)
+        self.assertEqual(again, {"file_info": "FCHUNK", "cached": True})
+        self.assertEqual(len(http.requests), calls_before)   # 命中缓存不再发请求
+
+    async def test_material_upload_one_shot(self):
+        import hashlib as _h
+        import tempfile
+
+        svc = RecordingSvc()
+        svc.add("a", "APP1")
+        http = svc.http_of("a")
+        http.response = {"upload_id": "U9", "presigned_url": "https://cos/put",
+                         "image_id": "IMG", "url": "qqbot-media://image/v1/tok",
+                         "ttl": 7776000}
+        bound = view_for(svc, "a")._bound
+        png = b"\x89PNG\r\n\x1a\n" + b"m" * 32
+        with tempfile.NamedTemporaryFile(suffix=".png") as tf:
+            tf.write(png)
+            tf.flush()
+            with patch("core.media.presigned_put", new=AsyncMock(return_value="etag1")) as put:
+                resp = await material_upload_bound(svc, bound, tf.name)
+        self.assertEqual(resp["url"], "qqbot-media://image/v1/tok")
+        m1, p1, kw1 = http.requests[0]
+        self.assertEqual((m1, p1), ("POST", "/v2/media-images/prepare"))
+        self.assertEqual(kw1["json"], {
+            "file_name": tf.name.rsplit("/", 1)[-1], "file_size": len(png),
+            "content_type": "image/png",
+            "md5": _h.md5(png).hexdigest(), "sha1": _h.sha1(png).hexdigest()})
+        put.assert_awaited_once_with("https://cos/put", png, "image/png")
+        m2, p2, kw2 = http.requests[1]
+        self.assertEqual((m2, p2), ("POST", "/v2/media-images/complete"))
+        self.assertEqual(kw2["json"], {"upload_id": "U9", "md5": "etag1"})
+        with self.assertRaises(QQOfficeAPIError):
+            await material_upload_bound(svc, bound, "https://x/a.png")
+
+    async def test_manage_material_contract(self):
+        from api.manage import ManageAPI
+
+        class _Rec:
+            def __init__(self):
+                self.calls = []
+
+            async def call(self, method, path, **kw):
+                self.calls.append((method, path))
+                return {}
+
+            async def material_upload(self, source):
+                self.calls.append(("DELEGATE", source))
+                return {}
+
+        rec = _Rec()
+        m = ManageAPI(rec)
+        await m.material_prepare("k.png", 10, "image/png", "m" * 32, "s" * 40)
+        await m.material_complete("U1", "m" * 32)
+        await m.material_list(cursor="c1")
+        await m.material_delete("IMG1")
+        await m.material_upload(b"png")
+        self.assertEqual([c[:2] for c in rec.calls], [
+            ("POST", "/v2/media-images/prepare"),
+            ("POST", "/v2/media-images/complete"),
+            ("GET", "/v2/media-images"),
+            ("DELETE", "/v2/media-images/IMG1/delete"),
+            ("DELEGATE", b"png"),
+        ])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
