@@ -1,8 +1,8 @@
 {
   "certified_bot": {
     "type": "bool",
-    "description": "认证主体机器人（全局默认）",
-    "hint": "群聊认证 60/分钟、未认证 30/分钟；C2C 认证 10/秒、未认证 5/秒且 30/分钟。可被下方「按机器人覆盖」逐 AppID 覆盖",
+    "description": "认证主体机器人（默认）",
+    "hint": "可被下方「按机器人覆盖」逐 AppID 覆盖",
     "default": false
   },
   "certified_bots": {
@@ -33,7 +33,7 @@
   "auto_degrade_proactive": {
     "type": "bool",
     "description": "超窗自动降级主动消息",
-    "hint": "被动回复窗口（群 5 分钟/5 次、C2C 60 分钟/4 次）超窗/超次时降级主动消息；关闭则超窗直接抛错",
+    "hint": "被动回复窗口超窗/超次时降级主动消息；关闭则超窗直接抛错",
     "default": true
   },
   "dot_replace": {
@@ -45,7 +45,7 @@
   "interaction_auto_ack": {
     "type": "bool",
     "description": "互动事件自动应答",
-    "hint": "仅按钮和快捷菜单（type=11/12）在 3 秒内按来源机器人自动 code=0 应答；需自定义应答内容时关闭",
+    "hint": "仅按钮和快捷菜单在 3 秒内按来源机器人自动 code=0 应答；需自定义应答内容时关闭",
     "default": true
   },
   "event_handler_concurrency": {
@@ -63,7 +63,7 @@
   "event_handler_timeout": {
     "type": "float",
     "description": "事件回调超时（秒）",
-    "hint": "0 表示不限时；超时取消回调并释放处理名额，需大于回调内发送的最长等待（主动配额最多等 65 秒）",
+    "hint": "0 表示不限时；超时取消回调并释放处理名额，需大于回调内发送的最长等待",
     "default": 0.0
   },
   "interaction_ack_concurrency": {
@@ -81,7 +81,7 @@
   "ref_ttl_days": {
     "type": "int",
     "description": "引用索引留存天数",
-    "hint": "msg_idx/ref_idx 本地留存（按机器人身份隔离）；0 表示不落盘仅内存",
+    "hint": "msg_idx/ref_idx 本地留存；0 表示不落盘仅内存",
     "default": 7
   },
   "ref_max_entries": {
@@ -93,7 +93,7 @@
   "retry_max": {
     "type": "int",
     "description": "频控重试次数上限",
-    "hint": "命中 429 类频控时自动等待重试（重试前核验同一机器人与代次）；token 重试固定 1 次不受控",
+    "hint": "命中 429 类频控时自动等待重试；token 重试固定 1 次不受控",
     "default": 3
   }
 }
