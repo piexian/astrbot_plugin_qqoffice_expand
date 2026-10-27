@@ -22,12 +22,15 @@
 | 撤回 | `c2c.recall`、`group.recall` | [单聊撤回](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_messages_message_id.delete.html)、[群聊撤回](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages_message_id.delete.html)：10 QPS，2 分钟内；群管理员可撤普通成员消息 |
 | 输入状态、互动召回 | `c2c.input_notify`、`c2c.wakeup` | 复用单聊发送接口；输入状态最长 60 秒，keepalive 句柄由调用方取消 |
 | 独立流式分片 | `c2c.stream_send` | [stream_messages](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_stream_messages.post.html)：50 QPS，`index` 从 0 递增，结束片 `input_state=10`；首片响应 `id` 用作续片 `stream_msg_id` |
-| 普通上传 | `c2c.upload`、`group.upload` | [单聊 files](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_files.post.html)、[群聊 files](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_files.post.html)：50 QPS；保留现有 URL/本地上传入口 |
+| 普通上传 | `c2c.upload`、`group.upload` | [单聊 files](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_files.post.html)、[群聊 files](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_files.post.html)：50 QPS；本地直传自动带 `file_name`（二进制直传必填），超过 5MB 自动改走分片链路 |
+| 素材图片 | `manage.material_prepare`、`manage.material_complete`、`manage.material_list`、`manage.material_delete`、`manage.material_upload` | [素材管理](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/material-management.html)：图片 ≤10MB（png/jpeg/gif/webp），单机器人 100 张、90 天滑动过期；`material_upload` 一步返回 Markdown 可用的 `qqbot-media://` 引用 |
 | 分片上传控制 | 两个命名空间都有 `upload_prepare`、`upload_part_finish`、`upload_complete` | [单聊预上传](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_id_upload_prepare.post.html)、[单聊分片确认](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_id_upload_part_finish.post.html)、[群预上传](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_id_upload_prepare.post.html)、[群分片确认](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_id_upload_part_finish.post.html)：准备和确认 10 QPS，合并走 files |
 
 AstrBot 基线已有 `send_streaming(generator)`，使用 `/messages` 上的旧 `stream` 字段。`c2c.stream_send` 补充新的 `/stream_messages` 协议，不替换 AstrBot 的生成器调度，也不据此认定旧协议失效。同一流的续片不重复消耗本插件的普通被动回复次数；`msg_seq` 不传时首片按回复键分配，续片自动沿用首片序号；显式传入时由调用方保持一致。首片被动窗口失效时直接报错，由调用方决定是否显式开启主动流，避免首片与续片使用不同的引用参数。
 
-分片控制接口供需要控制上传流程的插件使用：计算校验值 → `upload_prepare` → 按返回的 `parts` 向预签名 URL 执行 PUT → 每片 `upload_part_finish` → `upload_complete`。大小字段按官方要求发送字符串，`md5_10m` 取前 **10002432 字节**。预签名 PUT、并发和重试由调用方依据 `upload_config` 管理；普通发送仍可使用 AstrBot 的现有完整分片上传流程。
+分片控制接口供需要控制上传流程的插件使用：计算校验值 → `upload_prepare` → 按返回的 `parts` 向预签名 URL 执行 PUT → 每片 `upload_part_finish` → `upload_complete`。大小字段按官方要求发送字符串，`md5_10m` 取前 **10002432 字节**。预签名 PUT、并发和重试由调用方依据 `upload_config` 管理；普通发送仍可使用 AstrBot 的现有完整分片上传流程。`c2c.upload`/`group.upload` 遇到超过 5MB 的本地文件时自动走同一条分片链路（含 `file_name`），调用方无需自行分流。
+
+素材图片用于 Markdown 消息：`url = (await qq.manage.material_upload("kline.png"))["url"]`，随后在 markdown content 中以 `![说明 #宽px #高px](url)` 引用；与公网图片 URL 可混用。
 
 主动配额按场景分开：[官方规则](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)中群聊认证主体 60/分钟、未认证 30/分钟；C2C 认证主体 10/秒、未认证 5/秒且 30/分钟。两种场景各有单关系 20/分钟、1000/天限制。频道不套用这些 QQ 私聊/群聊配额，文字子频道的 5/秒限制按子频道计数；频道可配置主动额度及私信每日额度由服务端裁决。
 

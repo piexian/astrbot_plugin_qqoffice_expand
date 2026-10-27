@@ -223,7 +223,8 @@ proxy = type("P", (), {"_client": _ViewCap()})()
 reg = Registry()
 for name, fn in fns.items():
     reg.register_fn(f"manage.{name}", fn)
-t("registry count", len(reg.names()) == 10 and "manage.interaction_ack" in reg.names())
+t("registry count", len(reg.names()) == 15 and "manage.interaction_ack" in reg.names()
+  and "manage.material_upload" in reg.names())
 
 async def _reg_unknown():
     try:
