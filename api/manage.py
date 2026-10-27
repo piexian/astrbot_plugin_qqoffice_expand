@@ -19,6 +19,7 @@ class ManageAPI:
         """PUT /interactions/{interaction_id}：按钮/快捷菜单回调必须在 3 秒内
         应答，同一 id 只能应答一次。code: 0成功 1失败 2频繁 3重复 4无权限 5仅管理员。
 
+        重复调用抛 QQOfficeDuplicateAck；自定义 code 应关闭自动应答。
         _phase 为内部参数：自动 ACK 的阶段跟踪器（进入 SDK 置位），调用方无需传。
         """
         body: dict[str, Any] = {"code": code}

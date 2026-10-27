@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import heapq
+import random
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -43,6 +44,7 @@ __all__ = [
     "RouteCore",
     "current_http",
     "client_is_closing",
+    "generate_msg_seq",
 ]
 
 PRODUCTION = "production"
@@ -132,6 +134,15 @@ class OperationContext:
     generation: int
 
 
+def generate_msg_seq() -> int:
+    """回复键首个序号的随机基数。
+
+    取值空间约 1e8：同一 msg_id 上本体用 randint(1, 10000) 回复，
+    从 1 起步会与其撞号（平台按 msg_id+msg_seq 去重）。
+    """
+    return (int(time.time() * 1000) % 100_000_000) ^ random.getrandbits(16)
+
+
 class PassiveWindows:
     """robot_key 级被动回复窗口（群 5min/5 次、C2C 60min/4 次）。
 
@@ -147,7 +158,8 @@ class PassiveWindows:
     LIMITS = {"group": (300.0, 5), "c2c": (3600.0, 4)}
 
     def __init__(self):
-        # (scene, target, msg_id) -> [first_ts, count, last_ts, version]；保留插入序。
+        # (scene, target, msg_id) -> [first_ts, count, last_ts, version, seq, streams]；
+        # streams 为 {stream_msg_id: 首片序号}，按需创建。
         self._records: OrderedDict[tuple, list] = OrderedDict()
         self._queues: dict[str, list[tuple[float, int, tuple]]] = {}  # scene -> 堆
         self._rotate = 0   # 跨调用 scene 轮转指针（预算公平）
@@ -165,7 +177,7 @@ class PassiveWindows:
         rec = self._records.get(self._key(scene, target, msg_id))
         if rec is None:
             return True, ""
-        first_ts, count, last_ts, _ = rec
+        first_ts, count, last_ts = rec[:3]
         now = time.monotonic()
         if now - first_ts > window:
             return False, "窗口已过期"
@@ -187,13 +199,42 @@ class PassiveWindows:
             return False, f"已达被动回复上限（{max_count} 次）"
         if rec is None:
             self._version += 1
-            self._records[key] = [now, 1, now, self._version]
+            self._records[key] = [now, 1, now, self._version, 0, None]
             heapq.heappush(self._queues.setdefault(scene, []), (now + window, self._version, key))
         else:
             rec[1] += 1
             rec[2] = now
             self._records.move_to_end(key)
         return True, ""
+
+    def next_seq(
+        self, scene: str, target: str | None, msg_id: str, explicit: int | None = None
+    ) -> int:
+        """同一回复键单调分配序号；首个取随机基数，退额度不退序号。"""
+        rec = self._records[self._key(scene, target, msg_id)]
+        previous = rec[4]
+        if explicit is not None:
+            value = explicit
+        else:
+            value = previous + 1 if previous else generate_msg_seq()
+        rec[4] = max(previous, value)
+        return value
+
+    def bind_stream(self, scene: str, target: str | None, msg_id: str,
+                    stream_id: str, seq: int) -> None:
+        """记录流首片序号，续片未显式传 msg_seq 时沿用。"""
+        rec = self._records.get(self._key(scene, target, msg_id))
+        if rec is not None:
+            if rec[5] is None:
+                rec[5] = {}
+            rec[5][str(stream_id)] = seq
+
+    def stream_seq(self, scene: str, target: str | None, msg_id: str,
+                   stream_id: str) -> int | None:
+        rec = self._records.get(self._key(scene, target, msg_id))
+        if rec is None or not rec[5]:
+            return None
+        return rec[5].get(str(stream_id))
 
     def release(self, scene: str, target: str | None, msg_id: str) -> None:
         """发送前确定性失败：释放一次预留（不回收已过期的清理键）。"""

@@ -48,6 +48,30 @@
     "hint": "仅按钮和快捷菜单（type=11/12）在 3 秒内按来源机器人自动 code=0 应答；需自定义应答内容时关闭",
     "default": true
   },
+  "event_handler_concurrency": {
+    "type": "int",
+    "description": "事件处理并发数",
+    "hint": "普通订阅回调的并发上限；自动 ACK 独立运行",
+    "default": 16
+  },
+  "event_queue_size": {
+    "type": "int",
+    "description": "事件等待队列容量",
+    "hint": "按待执行回调计数；队列满时拒绝新增回调并计入状态",
+    "default": 1024
+  },
+  "event_handler_timeout": {
+    "type": "float",
+    "description": "事件回调超时（秒）",
+    "hint": "0 表示不限时；超时取消回调并释放处理名额，需大于回调内发送的最长等待（主动配额最多等 65 秒）",
+    "default": 0.0
+  },
+  "interaction_ack_concurrency": {
+    "type": "int",
+    "description": "自动应答并发上限",
+    "hint": "达到上限跳过新增自动 ACK 并计数；已有应答保留",
+    "default": 128
+  },
   "enable_group_member_events": {
     "type": "bool",
     "description": "订阅群成员进出事件",

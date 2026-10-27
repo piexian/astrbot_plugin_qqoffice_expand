@@ -181,9 +181,24 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
         key = ("c2c", "U", "REQUEST")
         self.assertEqual(state.windows._records[key][1], 1)   # 预留 1 次，续片不扣
         self.assertTrue(all(req[1] == "/v2/users/U/stream_messages" for req in http.requests))
-        self.assertTrue(all(req[2]["json"]["msg_seq"] == 1 for req in http.requests))
+        seqs = {req[2]["json"]["msg_seq"] for req in http.requests}
+        self.assertEqual(len(seqs), 1)   # 首片分配序号，续片未传时沿用
         self.assertFalse(state.rate.c2c_proactive._robot)
         self.assertEqual(state.rate._buckets["c2c.stream"].count, 50)
+
+    async def test_stream_continuation_reuses_allocated_sequence(self):
+        svc = RecordingSvc()
+        svc.add("u", "APP1")
+        http = svc.http_of("u")
+        http.response = {"id": "STREAM"}
+        api = C2CAPI(view_for(svc, "u"))
+        await api.send("U", "先回复一条", msg_id="REQUEST")
+        first = await api.stream_send("U", "a", msg_id="REQUEST")
+        await api.stream_send("U", "b", msg_id="REQUEST", stream_msg_id=first["id"],
+                              index=1, input_state=10)
+        reply, head, tail = (req[2]["json"]["msg_seq"] for req in http.requests)
+        self.assertEqual(head, reply + 1)
+        self.assertEqual(tail, head)
 
     async def test_passive_window_reserve_degrade_and_isolation(self):
         svc = RecordingSvc()

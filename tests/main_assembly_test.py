@@ -355,10 +355,10 @@ async def test_edge_semantics():
 async def test_dispatch_outcomes():
     # 被动回复自动生成 msg_seq
     async with service() as (svc, pm, inst):
-        with patch.object(C, "generate_msg_seq", return_value=4242):
-            await svc.instance("A").group.send("G", "reply", msg_id="M")
-        payload = inst.client.http.calls[-1][2]["json"]
-        t("被动回复自动生成 msg_seq", payload.get("msg_seq") == 4242, payload)
+        await svc.instance("A").group.send("G", "reply", msg_id="M")
+        await svc.instance("A").group.send("G", "reply again", msg_id="M")
+        sequences = [call[2]["json"]["msg_seq"] for call in inst.client.http.calls]
+        t("被动回复序号按消息递增", sequences[1] == sequences[0] + 1, sequences)
     # 不篡改共享 HTTP 方法
     async with service() as (svc, pm, inst):
         retained = []
