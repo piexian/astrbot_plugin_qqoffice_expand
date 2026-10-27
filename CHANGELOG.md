@@ -2,7 +2,7 @@
 
 本文件记录各版本的主要变化，版本号与 `metadata.yaml` 一致，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [未发布]
+## [0.3.3] - 2026-10-28
 
 ### 变更
 
