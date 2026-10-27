@@ -164,9 +164,9 @@ async def rl_test():
     t("rl snapshot", snap["proactive"]["robot_per_minute"] == 30)
     rl2 = RateLimiter(certified_bot=True)
     t("rl certified 60", rl2.snapshot()["proactive"]["robot_per_minute"] == 60)
-    # 增量回收：请求只裁剪当前目标
+    # 增量回收：请求只裁剪当前目标（t1 本分钟配额已满，换新目标避免真实等待）
     rl.proactive._rel_minute["old-target"] = __import__("collections").deque([time.monotonic() - 3600])
-    await rl.consume_proactive("t1")
+    await rl.consume_proactive("t3")
     t("rl hot path not scanning others", "old-target" in rl.proactive._rel_minute)
     # 日计数未过期：只清分钟窗口，不删目标（防止当日额度重发）
     removed = rl.proactive.prune_idle(limit=16)

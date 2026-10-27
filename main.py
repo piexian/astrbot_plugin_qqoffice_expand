@@ -45,6 +45,7 @@ from .core.plugin_service import (
 from .core.ratelimit import RateLimiter
 from .core.refstore import RefStore
 from .core.registry import Registry, collect_methods
+from .core.token_guard import TokenRefreshGuard
 from .core.routing import (
     BoundSource,
     EventSource,
@@ -67,9 +68,11 @@ class Main(Star):
         self.event_bus = EventBus(self.config, logger)
         self.refstore: RefStore | None = None
         self._coordinator: asyncio.Task | None = None
+        self._terminating: asyncio.Event | None = None   # 进行中的卸载，完成或失败时置位
         # 公开门面：构造后即可获取（state=initializing），生命周期见
         # core/plugin_service.py；旧 ready/status/wait_ready 由它驱动。
         self._service = QQOfficeService(self)
+        self._token_guard = TokenRefreshGuard()
         self.patcher: AdapterPatcher | None = None
         self.routes: RouteCore | None = None
         self.states: RobotStates | None = None
@@ -91,6 +94,10 @@ class Main(Star):
         try:
             await self._initialize()
         except BaseException:
+            try:
+                await self._terminate()
+            except BaseException as exc:
+                logger.error(f"[qqoffice_expand] 初始化失败后的清理异常: {exc!r}")
             self._service.mark_unavailable("initialize_failed")
             raise
         self._service.mark_ready()
@@ -124,6 +131,7 @@ class Main(Star):
         self.routes.bind_view_factory(lambda bound: BoundView(self, bound))
         self.patcher = AdapterPatcher(self.routes, self.event_bus, cfg, logger)
         self.patcher.set_inbound_recorder(self._record_inbound)
+        self._token_guard.install()
         self.patcher.install_adapter_hooks()  # 构造期注入，必须先于平台实例化
         self.event_bus.set_ack_caller(self._ack_interaction)
         self.event_bus.bind_routes(self.routes)
@@ -136,11 +144,22 @@ class Main(Star):
         )
 
     async def terminate(self) -> None:
-        self._service.mark_closing()   # 一开始拒绝新业务（门面与旧入口一致）
-        try:
-            await self._terminate()
-        finally:
-            self._service.mark_closed()   # 旧服务永久失效；get_status 仍可查询
+        while self._service.state != "closed":
+            if self._terminating is not None:
+                # 被本次卸载等待的回调不能反过来等待卸载完成。
+                if asyncio.current_task() in self.event_bus._tasks:
+                    return
+                await self._terminating.wait()
+                continue   # 上一次清理失败或被取消：由本调用重试
+            done = self._terminating = asyncio.Event()
+            self._service.mark_closing()
+            try:
+                await self._terminate()
+                # 清理全部完成才置 closed，否则后续 terminate 无法补做。
+                self._service.mark_closed()
+            finally:
+                self._terminating = None
+                done.set()
 
     async def _terminate(self) -> None:
         if self.routes is not None:
@@ -155,7 +174,8 @@ class Main(Star):
         if self.event_bus:
             await self.event_bus.stop()   # 取消并等待本插件拥有的事件/ACK 任务
         if self.patcher:
-            await self.patcher.stop()     # 还原补丁、卸载构造期钩子、停用旧回调
+            await self.patcher.stop()  # 还原补丁、卸载构造期钩子、停用旧回调
+        await self._token_guard.stop()
         if self.refstore:
             self.refstore.close()
         logger.info("[qqoffice_expand] 已卸载（补丁还原、任务取消、refstore 落盘）")
@@ -407,6 +427,11 @@ class Main(Star):
         lines.append(f"全局订阅: {ev['subscribers'] or '{}'} on_any={ev['any_subscribers']}")
         lines.append(f"实例作用域订阅: {ev.get('scoped_subscribers') or '{}'}")
         lines.append(f"事件到达计数: {ev['counts'] or '{}'} 自动应答 {ev['auto_acked']} 次")
+        lines.append(
+            f"事件处理: 运行 {ev['active_handlers']}，等待 {ev['queued_handlers']}，"
+            f"丢弃 {ev['dropped_handlers']}，超时 {ev['handler_timeouts']}；"
+            f"ACK 在途 {ev['pending_acks']}，跳过 {ev['dropped_acks']}"
+        )
         lines.append(f"命名方法 {len(st['registry_methods'])} 个")
         return "\n".join(lines)
 
