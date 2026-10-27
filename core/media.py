@@ -26,6 +26,8 @@ __all__ = [
     "upload_digests",
     "image_content_type",
     "presigned_put",
+    "sniff_image_content_type",
+    "IMAGE_EXT_BY_TYPE",
 ]
 
 DEFAULT_IMAGE_SIZE = (512, 512)
@@ -226,6 +228,21 @@ _MD5_10M_LIMIT = 10002432   # 官方 md5_10m 取前 10002432 字节（约 10MB�
 IMAGE_CONTENT_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 _IMAGE_MIME_BY_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                       ".gif": "image/gif", ".webp": "image/webp"}
+IMAGE_EXT_BY_TYPE = {"image/png": ".png", "image/jpeg": ".jpg",
+                     "image/gif": ".gif", "image/webp": ".webp"}
+_IMAGE_MAGIC = ((b"\x89PNG\r\n\x1a\n", "image/png"), (b"GIF8", "image/gif"),
+                (b"\xff\xd8\xff", "image/jpeg"))
+
+
+def sniff_image_content_type(data: bytes) -> str:
+    """按魔数判定图片类型（WEBP 需 RIFF 头 + WEBP 标记）；非图片返回空串。"""
+    head = data[:16]
+    for magic, mime in _IMAGE_MAGIC:
+        if head.startswith(magic):
+            return mime
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
 
 
 def upload_digests(data: bytes) -> tuple[str, str, str]:
@@ -254,9 +271,18 @@ async def presigned_put(url: str, data: bytes, content_type: str = "") -> str | 
 
     headers = {"Content-Type": content_type} if content_type else {}
     timeout = aiohttp.ClientTimeout(total=600, connect=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.put(url, data=data, headers=headers) as resp:
-            if not 200 <= resp.status < 300:
-                hint = (await resp.text())[:120]
-                raise QQOfficeGatewayError(resp.status, None, hint)
-            return (resp.headers.get("ETag") or "").strip('"') or None
+    import asyncio
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.put(url, data=data, headers=headers) as resp:
+                if not 200 <= resp.status < 300:
+                    hint = (await resp.text())[:120]
+                    raise QQOfficeGatewayError(resp.status, None, hint)
+                return (resp.headers.get("ETag") or "").strip('"') or None
+    except QQOfficeGatewayError:
+        raise
+    except asyncio.TimeoutError:
+        raise QQOfficeGatewayError(504, None, "预签名 PUT 超时")
+    except aiohttp.ClientError as exc:
+        raise QQOfficeGatewayError(502, None, f"预签名 PUT 传输失败: {exc}") from exc

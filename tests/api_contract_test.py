@@ -563,5 +563,72 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
             ("DELEGATE", b"png"),
         ])
 
+    async def test_material_bytes_source_sniffs_type(self):
+        import hashlib as _h
+
+        svc = RecordingSvc()
+        svc.add("a", "APP1")
+        http = svc.http_of("a")
+        http.response = {"upload_id": "U9", "presigned_url": "https://cos/put",
+                         "image_id": "IMG", "url": "qqbot-media://image/v1/tok"}
+        bound = view_for(svc, "a")._bound
+        png = b"\x89PNG\r\n\x1a\n" + b"n" * 16
+        with patch("core.media.presigned_put", new=AsyncMock(return_value="etag1")):
+            await material_upload_bound(svc, bound, png)
+        # bytes 来源无扩展名：魔数判定 image/png，文件名改规范名 image.png
+        body = http.requests[0][2]["json"]
+        self.assertEqual(body["content_type"], "image/png")
+        self.assertEqual(body["file_name"], "image.png")
+        self.assertEqual(body["md5"], _h.md5(png).hexdigest())
+
+    async def test_error_advice_table_integrity(self):
+        from core.errors import ERROR_ADVICE
+
+        self.assertEqual(list(ERROR_ADVICE).count(40093002), 1)
+        self.assertIn(630001, ERROR_ADVICE)
+        for code in (40035001, 40035002, 40035003, 40035006,
+                     40035007, 40035008, 40035009, 40035010):
+            self.assertIn(code, ERROR_ADVICE)
+
+    async def test_presigned_put_normalizes_transport_errors(self):
+        import asyncio as _aio
+
+        import aiohttp as _ah
+        from core.media import presigned_put
+
+        class _PutBoom:
+            def __init__(self, exc):
+                self._exc = exc
+
+            async def __aenter__(self):
+                raise self._exc
+
+            async def __aexit__(self, *a):
+                return False
+
+        class _Session:
+            exc = TimeoutError()
+
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            def put(self, *a, **k):
+                return _PutBoom(_Session.exc)
+
+        with patch("aiohttp.ClientSession", new=_Session):
+            with self.assertRaises(QQOfficeGatewayError) as cm:
+                await presigned_put("https://cos/x", b"d")
+            self.assertEqual(cm.exception.code, 504)
+            _Session.exc = _ah.ClientError("reset")
+            with self.assertRaises(QQOfficeGatewayError) as cm:
+                await presigned_put("https://cos/x", b"d")
+            self.assertEqual(cm.exception.code, 502)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -631,7 +631,8 @@ async def material_upload_bound(svc, bound: BoundSource, source) -> dict:
 
     上限 10MB、png/jpeg/gif/webp、单机器人 100 张；引用见 docs 素材管理页。
     """
-    from .media import image_content_type, presigned_put, to_uploadable, upload_digests
+    from .media import (IMAGE_EXT_BY_TYPE, image_content_type, presigned_put,
+                        sniff_image_content_type, to_uploadable, upload_digests)
 
     routes: RouteCore = svc.routes
     route, _http = routes.resolve(bound)
@@ -644,12 +645,24 @@ async def material_upload_bound(svc, bound: BoundSource, source) -> dict:
     routes.check_context(ctx)
     if len(data) > 10 * 1024 * 1024:
         raise QQOfficeAPIError(-1, f"素材图片超 10MB 上限: {len(data)} 字节")
-    content_type = image_content_type(up.filename, up.mime)
+    try:
+        content_type = image_content_type(up.filename, up.mime)
+    except QQOfficeAPIError:
+        # bytes/裸 base64 来源无扩展名与 MIME：按魔数兜底判定
+        content_type = sniff_image_content_type(data)
+        if not content_type:
+            raise
+    file_name = up.filename
+    # 官方校验扩展名与 content_type 一致（40035001），不一致时改用规范名
+    known_exts = {".jpg", ".jpeg"} if content_type == "image/jpeg" else {
+        IMAGE_EXT_BY_TYPE[content_type]}
+    if not any(file_name.lower().endswith(e) for e in known_exts):
+        file_name = "image" + IMAGE_EXT_BY_TYPE[content_type]
     md5, sha1, _ = upload_digests(data)
 
     prep = await execute_call(
         svc, bound, "POST", "/v2/media-images/prepare",
-        json={"file_name": up.filename, "file_size": len(data),
+        json={"file_name": file_name, "file_size": len(data),
               "content_type": content_type, "md5": md5, "sha1": sha1},
         endpoint_key="material.api", _ctx=ctx,
     )
