@@ -1,6 +1,7 @@
-"""媒体归一与下载。
+"""媒体归一。
 
 to_uploadable(): URL / base64 / 本地路径 / bytes 归一为可上传对象
+  URL 只交给 QQ 文件接口由官方服务器拉取，插件不在本机下载，因此不做地址校验。
 strip_amr_header(): .amr 实为带 #!AMR 头的 SILK，发前剥头
 image_size(): 只读 64KB 头解析 PNG/JPEG/GIF/WebP 尺寸，默认 512x512
 """
@@ -22,7 +23,6 @@ __all__ = [
     "to_uploadable",
     "strip_amr_header",
     "image_size",
-    "download_url",
 ]
 
 DEFAULT_IMAGE_SIZE = (512, 512)
@@ -49,7 +49,7 @@ class Uploadable:
         return self._bytes
 
     async def load_bytes(self) -> bytes:
-        """按需取得原始字节：base64/bytes 直接返回；path 读文件；url 下载。"""
+        """按需取得原始字节：base64/bytes 直接返回；path 读文件；url 不在本机下载。"""
         if self._bytes is not None:
             return self._bytes
         if self.kind == "bytes":
@@ -62,7 +62,8 @@ class Uploadable:
                 raise QQOfficeAPIError(-1, f"本地文件不存在: {p}")
             data = p.read_bytes()
         elif self.kind == "url":
-            data = await download_url(str(self.source))
+            # 本机下载用户给的 URL 会引入 SSRF，URL 只能交给 QQ 服务器拉取。
+            raise QQOfficeAPIError(-1, "URL 来源由 QQ 服务器拉取，插件不在本机下载")
         else:
             raise QQOfficeAPIError(-1, f"未知上传来源类型: {self.kind}")
         self._bytes = data
@@ -129,20 +130,6 @@ def _looks_like_base64(s: str) -> bool:
     except (binascii.Error, ValueError):
         return False
     return True
-
-
-async def download_url(url: str, *, timeout: float = 30.0, max_bytes: int = 2 * 1024**3) -> bytes:
-    """下载远程资源。"""
-    import httpx
-
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-        resp = await client.get(url)
-        if resp.status_code >= 400:
-            raise QQOfficeAPIError(-1, f"下载失败 HTTP {resp.status_code}: {url[:80]}")
-        data = resp.content
-    if len(data) > max_bytes:
-        raise QQOfficeAPIError(-1, f"下载内容超过上限 {max_bytes} 字节")
-    return data
 
 # ---------------- AMR/SILK ----------------
 

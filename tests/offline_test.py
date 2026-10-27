@@ -186,6 +186,17 @@ t("up b64", up2.kind == "base64")
 up3 = media.to_uploadable(b"\x00\x01\x02")
 t("up bytes", up3.kind == "bytes" and up3.size == 3)
 t("up url 不再校验地址", media.to_uploadable("https://127.0.0.1/x.png").kind == "url")
+for _scheme_url in ("ftp://example.com/x", "file:///etc/passwd"):
+    try:
+        media.to_uploadable(_scheme_url)
+        t(f"非 http(s) 拒绝 {_scheme_url}", False)
+    except errors.QQOfficeAPIError:
+        t(f"非 http(s) 拒绝 {_scheme_url}", True)
+try:
+    asyncio.run(media.to_uploadable("https://example.com/a.png").load_bytes())
+    t("url 不在本机下载", False)
+except errors.QQOfficeAPIError:
+    t("url 不在本机下载", True)
 t("image_size gif", media.image_size(b"GIF89a" + struct.pack("<HH", 300, 200) + b"\x00" * 10) == (300, 200))
 t("image_size default", media.image_size(b"not-an-image") == (512, 512))
 amr = b"#!AMR\nSILK_PAYLOAD"

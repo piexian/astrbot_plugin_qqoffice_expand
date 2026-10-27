@@ -549,7 +549,7 @@ async def test_facade_binding_routing():
 async def test_readme_binding_checks_service_readiness():
     """执行 README 接入示例，确认未就绪与已关闭服务不会被绑定。"""
     text = (ROOT / "README.md").read_text(encoding="utf-8")
-    example = text.split("## 使用\n", 1)[1].split("```python\n", 1)[1]
+    example = text.split("### 发现与绑定\n", 1)[1].split("```python\n", 1)[1]
     example = example.split("```", 1)[0]
     event_module = sys.modules["astrbot.api.event"]
     previous_filter = event_module.filter
