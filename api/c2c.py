@@ -52,11 +52,12 @@ class C2CAPI(MediaAPI):
                           input_state: int = 1, input_mode: str = "append",
                           content_type: str = "markdown", stream_msg_id: str | None = None,
                           msg_id: str | None = None, event_id: str | None = None,
-                          msg_seq: int = 1, is_wakeup: bool | None = None,
+                          msg_seq: int | None = None, is_wakeup: bool | None = None,
                           extra: dict | None = None) -> dict:
         """发送一个流式分片（50 QPS）。index 从 0 递增，结束片 input_state=10。
 
-        首片返回的 id 用作后续 stream_msg_id；同一流沿用 msg_id/event_id 和 msg_seq。
+        首片返回的 id 用作后续 stream_msg_id；同一流沿用 msg_id/event_id。
+        msg_seq 不传时首片按回复键分配，续片自动沿用首片序号。
         replace 模式提交全量文本，已下发前缀不可修改。群聊不支持此接口。
         被动窗口失效时首片抛错，不自动改变整条流的主动/被动模式。
         """

@@ -63,8 +63,8 @@
   "event_handler_timeout": {
     "type": "float",
     "description": "事件回调超时（秒）",
-    "hint": "超时取消回调并释放处理名额",
-    "default": 30.0
+    "hint": "0 表示不限时；超时取消回调并释放处理名额，需大于回调内发送的最长等待（主动配额最多等 65 秒）",
+    "default": 0.0
   },
   "interaction_ack_concurrency": {
     "type": "int",

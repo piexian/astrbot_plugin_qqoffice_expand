@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import random
 import re as _re
 import time
 from dataclasses import dataclass
@@ -34,17 +33,13 @@ from .routing import (
     PassiveWindows,
     RobotState,
     RouteCore,
+    generate_msg_seq,
 )
 
 __all__ = ["generate_msg_seq", "resolve_endpoint_key", "execute_call",
            "send_rich_bound", "upload_media_bound"]
 
 _DOT_RE = _re.compile(r"([A-Za-z0-9\u4e00-\u9fff])\.([A-Za-z0-9\u4e00-\u9fff])")
-
-
-def generate_msg_seq() -> int:
-    """兼容序号生成器；实际发送按回复键递增。"""
-    return (int(time.time() * 1000) % 100_000_000) ^ random.getrandbits(16)
 
 
 # 端点 key 解析表（顺序敏感；新端点在此加一行即可）
@@ -204,6 +199,13 @@ async def _execute_call_body(svc, routes, bound, ctx, route, state, method,
         payload["msg_seq"] = state.windows.next_seq(
             "c2c", target, payload["msg_id"], payload.get("msg_seq")
         )
+    elif continuation and payload.get("msg_id") and payload.get("msg_seq") is None:
+        # 续片不传序号时平台按 1 处理，会与首片分配的序号不一致。
+        seq = state.windows.stream_seq(
+            "c2c", target, payload["msg_id"], payload["stream_msg_id"]
+        )
+        if seq is not None:
+            payload["msg_seq"] = seq
     elif is_send and not continuation:
         msg_id = payload.get("msg_id")
         if msg_id and scene in PassiveWindows.LIMITS:
@@ -323,6 +325,11 @@ async def _execute_call_body(svc, routes, bound, ctx, route, state, method,
 
     if ack is not None:
         ack.finish(success=True)
+    if (is_stream and not continuation and isinstance(result, dict) and result.get("id")
+            and payload.get("msg_id") and payload.get("msg_seq") is not None):
+        state.windows.bind_stream(
+            "c2c", target, payload["msg_id"], result["id"], payload["msg_seq"]
+        )
 
     # —— 出站引用入库（带身份前缀）；预留默认归宿为已消耗 ——
     if isinstance(result, dict) and is_send and scene and target:

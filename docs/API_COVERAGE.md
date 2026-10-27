@@ -25,7 +25,7 @@
 | 普通上传 | `c2c.upload`、`group.upload` | [单聊 files](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_files.post.html)、[群聊 files](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_files.post.html)：50 QPS；保留现有 URL/本地上传入口 |
 | 分片上传控制 | 两个命名空间都有 `upload_prepare`、`upload_part_finish`、`upload_complete` | [单聊预上传](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_id_upload_prepare.post.html)、[单聊分片确认](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_id_upload_part_finish.post.html)、[群预上传](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_id_upload_prepare.post.html)、[群分片确认](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_id_upload_part_finish.post.html)：准备和确认 10 QPS，合并走 files |
 
-AstrBot 基线已有 `send_streaming(generator)`，使用 `/messages` 上的旧 `stream` 字段。`c2c.stream_send` 补充新的 `/stream_messages` 协议，不替换 AstrBot 的生成器调度，也不据此认定旧协议失效。同一流的续片不重复消耗本插件的普通被动回复次数；`msg_seq` 默认 1，可显式设置，并在同一流内保持一致。首片被动窗口失效时直接报错，由调用方决定是否显式开启主动流，避免首片与续片使用不同的引用参数。
+AstrBot 基线已有 `send_streaming(generator)`，使用 `/messages` 上的旧 `stream` 字段。`c2c.stream_send` 补充新的 `/stream_messages` 协议，不替换 AstrBot 的生成器调度，也不据此认定旧协议失效。同一流的续片不重复消耗本插件的普通被动回复次数；`msg_seq` 不传时首片按回复键分配，续片自动沿用首片序号；显式传入时由调用方保持一致。首片被动窗口失效时直接报错，由调用方决定是否显式开启主动流，避免首片与续片使用不同的引用参数。
 
 分片控制接口供需要控制上传流程的插件使用：计算校验值 → `upload_prepare` → 按返回的 `parts` 向预签名 URL 执行 PUT → 每片 `upload_part_finish` → `upload_complete`。大小字段按官方要求发送字符串，`md5_10m` 取前 **10002432 字节**。预签名 PUT、并发和重试由调用方依据 `upload_config` 管理；普通发送仍可使用 AstrBot 的现有完整分片上传流程。
 

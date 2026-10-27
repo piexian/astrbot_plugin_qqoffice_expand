@@ -1,6 +1,7 @@
 """并发发送、ACK、事件积压与卸载的行为回归。"""
 
 import asyncio
+import contextvars
 import importlib.util
 import sys
 import unittest
@@ -16,6 +17,14 @@ fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 M, C, R = fixture.M, fixture.C, fixture.R
 E = __import__("qqoffice_main_test.core.events", fromlist=["EventBus"])
+
+
+async def drain(bus):
+    """等待运行中及排队转入的回调全部结束（排队回调在前者完成后才建 Task）。"""
+    while bus._tasks:
+        await asyncio.gather(*list(bus._tasks))
+        # 任务全部已完成时 gather 不让出事件循环；让完成回调先移出集合、启动排队回调。
+        await asyncio.sleep(0)
 
 
 class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
@@ -111,7 +120,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             pm._inst_map["B"] = {"inst": second}
             svc.refresh()
             views = [svc.instance("A"), svc.instance("B")]
-            with patch.object(C.time, "time", return_value=1800000000.0):
+            with patch.object(R, "generate_msg_seq", return_value=50_000):
                 await asyncio.gather(
                     *(
                         views[i % 2].group.send("G", str(i), msg_id="M")
@@ -123,7 +132,8 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 for ad in (inst, second)
                 for c in ad.client.http.calls
             ]
-            self.assertEqual(sorted(seqs), [1, 2, 3, 4, 5])
+            # 首个序号取随机基数（不从 1 起步，避开本体 randint(1, 10000)）。
+            self.assertEqual(sorted(seqs), list(range(50_000, 50_005)))
         async with fixture.service() as (svc, _, inst):
 
             def reject(*args):
@@ -315,9 +325,9 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             inst.client.http.on_request = reject_once
             with patch.object(C.asyncio, "sleep", return_value=None):
                 await svc.instance("A").group.send("G", "reply", msg_id="M")
-            self.assertEqual(
-                [call[2]["json"]["msg_seq"] for call in inst.client.http.calls], [1, 1]
-            )
+            seqs = [call[2]["json"]["msg_seq"] for call in inst.client.http.calls]
+            self.assertEqual(len(seqs), 2)
+            self.assertEqual(seqs[0], seqs[1])
 
     async def test_cancelled_handler_does_not_strand_queued_jobs(self):
         bus = E.EventBus({"event_handler_concurrency": 1, "event_queue_size": 3})
@@ -335,7 +345,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await bus.emit(E.normalize_event("group_member_add", {"id": "first"}))
         await started.wait()
         await bus.emit(E.normalize_event("group_member_add", {"id": "queued"}))
-        worker = next(iter(bus._workers))
+        worker = next(iter(bus._handler_tasks))
         worker.cancel()
         await asyncio.wait_for(completed.wait(), timeout=1)
         self.assertEqual(received, ["queued"])
@@ -399,7 +409,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["queued_handlers"], 3)
         self.assertEqual(status["dropped_handlers"], 7)
         release.set()
-        await asyncio.gather(*list(bus._tasks))
+        await drain(bus)
         self.assertEqual(peak, 2)
         self.assertEqual(sorted(completed), [0, 1, 2, 3, 4])
         await bus.stop()
@@ -436,6 +446,102 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(svc._service.state, "closed")
             self.assertTrue(svc.patcher._stopping)
             self.assertEqual(svc.event_bus.status()["queued_handlers"], 0)
+
+    async def test_handler_timeout_zero_means_unlimited(self):
+        bus = E.EventBus({"event_handler_timeout": 0})
+        done = asyncio.Event()
+
+        async def handler(ev):
+            await asyncio.sleep(0.01)
+            done.set()
+
+        bus.on("GROUP_MEMBER_ADD", handler)
+        await bus.emit(E.normalize_event("group_member_add", {"id": "E"}))
+        await asyncio.wait_for(done.wait(), timeout=1)
+        self.assertEqual(bus.status()["handler_timeouts"], 0)
+        await bus.stop()
+
+    async def test_returned_task_is_not_awaited_or_cancelled(self):
+        bus = E.EventBus({"event_handler_timeout": 0.01})
+        jobs = []
+
+        async def job():
+            await asyncio.sleep(0.05)
+            return "done"
+
+        def handler(ev):
+            jobs.append(asyncio.create_task(job()))
+            return jobs[-1]
+
+        bus.on("GROUP_MEMBER_ADD", handler)
+        await bus.emit(E.normalize_event("group_member_add", {"id": "E"}))
+        await asyncio.gather(*list(bus._tasks))
+        self.assertFalse(jobs[0].done())   # 回调已结束，自建 Task 不占名额
+        self.assertEqual(await jobs[0], "done")
+        self.assertEqual(bus.status()["handler_timeouts"], 0)
+        await bus.stop()
+
+    async def test_queued_handlers_keep_isolated_context(self):
+        var = contextvars.ContextVar("qqoffice_test_marker", default=None)
+        bus = E.EventBus({"event_handler_concurrency": 1})
+        seen, finished = [], asyncio.Event()
+
+        async def handler(ev):
+            seen.append(var.get())
+            var.set("leaked")
+            await asyncio.sleep(0)
+            if len(seen) == 3:
+                finished.set()
+
+        bus.on("GROUP_MEMBER_ADD", handler)
+        for i in range(3):
+            var.set(f"emit-{i}")
+            await bus.emit(E.normalize_event("group_member_add", {"id": i}))
+        await asyncio.wait_for(finished.wait(), timeout=1)
+        self.assertEqual(seen, ["emit-0", "emit-1", "emit-2"])
+        await bus.stop()
+
+    async def test_terminate_cancelled_in_handler_is_retried(self):
+        async with fixture.service(event_handler_timeout=0.05) as (svc, _, inst):
+            original_stop = svc._token_guard.stop
+
+            async def slow_stop():
+                await asyncio.sleep(0.2)
+                await original_stop()
+
+            async def close(ev):
+                await svc.terminate()
+
+            svc._token_guard.stop = slow_stop
+            svc.on("GROUP_MEMBER_ADD", close)
+            await inst.client.on_group_member_add({"id": "E", "group_openid": "G"})
+            await asyncio.gather(*list(svc.event_bus._tasks))
+            self.assertEqual(svc.event_bus.status()["handler_timeouts"], 1)
+            self.assertEqual(svc._service.state, "closing")
+            self.assertIsNotNone(svc._token_guard._state)
+            await svc.terminate()
+            self.assertEqual(svc._service.state, "closed")
+            self.assertIsNone(svc._token_guard._state)
+
+    async def test_overload_warning_repeats_after_interval(self):
+        warnings = []
+        logger = fixture.NS(warning=warnings.append, error=lambda *a: None)
+        bus = E.EventBus({"event_handler_concurrency": 1, "event_queue_size": 1}, logger)
+        release = asyncio.Event()
+
+        async def slow(ev):
+            await release.wait()
+
+        bus.on("GROUP_MEMBER_ADD", slow)
+        for i in range(4):
+            await bus.emit(E.normalize_event("group_member_add", {"id": i}))
+        self.assertEqual(len(warnings), 1)   # 两次溢出只告警一次
+        bus._drop_warned["handlers"] -= E._DROP_WARN_INTERVAL
+        await bus.emit(E.normalize_event("group_member_add", {"id": 4}))
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("累计 3 次", warnings[-1])
+        release.set()
+        await bus.stop()
 
 
 if __name__ == "__main__":

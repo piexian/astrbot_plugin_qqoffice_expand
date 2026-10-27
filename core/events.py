@@ -20,8 +20,8 @@ INTERACTION_CREATE 的 type=11/12 自动 PUT /interactions/{id} code=0
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import time
-import inspect
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -31,6 +31,7 @@ from .errors import QQOfficeDuplicateAck
 from .routing import EventSource, RouteCore
 
 _RAW_EVENT: "object | None" = None  # 延迟创建的 ContextVar，见 _raw_event()
+_DROP_WARN_INTERVAL = 60.0   # 过载告警同类最短间隔（秒）
 
 __all__ = ["QQOfficeEvent", "EventBus", "AdapterPatcher", "EVENT_SPECS",
            "INTENT_BITS", "make_first_subscribe_hook"]
@@ -271,15 +272,14 @@ class EventBus:
         self._scoped_any: dict[tuple[str, str], list[Callable]] = {}    # (pid, appid)
         self._scoped_bits: dict[tuple[str, str], int] = {}  # (pid, prefix) -> 按需位缓存
         self._tasks: set[asyncio.Task] = set()
-        self._workers: set[asyncio.Task] = set()
-        self._queue: deque[tuple[Callable, QQOfficeEvent]] = deque()
+        self._handler_tasks: set[asyncio.Task] = set()
+        self._queue: deque[tuple[Callable, QQOfficeEvent, contextvars.Context]] = deque()
         self._handler_concurrency = max(
             1, int(self.config.get("event_handler_concurrency", 16))
         )
         self._queue_size = max(1, int(self.config.get("event_queue_size", 1024)))
-        self._handler_timeout = max(
-            0.001, float(self.config.get("event_handler_timeout", 30.0))
-        )
+        timeout = float(self.config.get("event_handler_timeout", 0) or 0)
+        self._handler_timeout = timeout if timeout > 0 else None   # 0 表示不限时
         self._ack_limit = max(
             1, int(self.config.get("interaction_ack_concurrency", 128))
         )
@@ -287,7 +287,9 @@ class EventBus:
         self.dropped_handlers = 0
         self.dropped_acks = 0
         self.handler_timeouts = 0
-        self._ack_caller: Callable[[Any, str], Any] | None = None  # (view, iid)
+        self._drop_warned: dict[str, float] = {}
+        # (view, iid, phase)；phase 为 AckReservation，需透传给 interaction_ack(_phase=)。
+        self._ack_caller: Callable[[Any, str, Any], Any] | None = None
         self._routes: RouteCore | None = None
         self._stopping = False   # 卸载后不再投递/应答
         self.counts: dict[str, int] = {}
@@ -296,6 +298,10 @@ class EventBus:
     async def stop(self) -> None:
         """停止排队任务；回调内卸载时不取消或等待自身。"""
         self._stopping = True
+        if self._queue and self.logger:
+            self.logger.warning(
+                f"[qqoffice_expand] 卸载丢弃 {len(self._queue)} 个排队中的事件回调"
+            )
         self._queue.clear()
         current = asyncio.current_task()
         tasks = [t for t in self._tasks if not t.done() and t is not current]
@@ -304,7 +310,7 @@ class EventBus:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.difference_update(tasks)
-        self._workers.difference_update(tasks)
+        self._handler_tasks.difference_update(tasks)
 
     # -- 订阅 --
 
@@ -403,7 +409,7 @@ class EventBus:
         """注入路由核心（自动 ACK 需要按来源建视图）。"""
         self._routes = routes
 
-    def set_ack_caller(self, caller: Callable[[Any, str], Any]) -> None:
+    def set_ack_caller(self, caller: Callable[[Any, str, Any], Any]) -> None:
         self._ack_caller = caller
 
     # -- 分发 --
@@ -431,46 +437,52 @@ class EventBus:
         task.add_done_callback(self._tasks.discard)
 
     def _enqueue_handler(self, handler, ev: QQOfficeEvent) -> None:
-        self._workers.difference_update(t for t in list(self._workers) if t.done())
-        if len(self._workers) < self._handler_concurrency:
-            task = asyncio.create_task(self._worker((handler, ev)))
-            self._workers.add(task)
-            task.add_done_callback(self._worker_done)
-            self._track_task(task)
+        # 排队时固定上下文副本：出队后的回调仍看到投递时的上下文。
+        context = contextvars.copy_context()
+        if len(self._handler_tasks) < self._handler_concurrency:
+            self._start_handler(handler, ev, context)
         elif len(self._queue) < self._queue_size:
-            self._queue.append((handler, ev))
+            self._queue.append((handler, ev, context))
         else:
             self.dropped_handlers += 1
-            if self.logger and self.dropped_handlers == 1:
-                self.logger.warning("[qqoffice_expand] 事件队列已满，拒绝新增处理回调")
+            self._warn_dropped("handlers", "事件队列已满，拒绝新增处理回调",
+                               self.dropped_handlers)
 
-    def _worker_done(self, task: asyncio.Task) -> None:
-        self._workers.discard(task)
-        if (
-            not self._stopping
-            and self._queue
-            and len(self._workers) < self._handler_concurrency
-        ):
-            self._enqueue_handler(*self._queue.popleft())
+    def _start_handler(self, handler, ev: QQOfficeEvent,
+                       context: contextvars.Context) -> None:
+        # 每个回调独立 Task：上下文互不串扰，回调内卸载可按当前 Task 排除自身。
+        task = asyncio.create_task(self._run_handler(handler, ev), context=context)
+        self._handler_tasks.add(task)
+        self._track_task(task)
+        task.add_done_callback(self._handler_done)
 
-    async def _worker(self, job) -> None:
-        while not self._stopping:
-            handler, ev = job
-            try:
-                async with asyncio.timeout(self._handler_timeout):
-                    await self._safe_call(handler, ev)
-            except TimeoutError:
-                self.handler_timeouts += 1
-                if self.logger:
-                    self.logger.error(f"[qqoffice_expand] 事件处理器超时 ({ev.type})")
-            if self._stopping or not self._queue:
-                return
-            job = self._queue.popleft()
+    def _handler_done(self, task: asyncio.Task) -> None:
+        self._handler_tasks.discard(task)
+        if not self._stopping and self._queue:
+            self._start_handler(*self._queue.popleft())
+
+    async def _run_handler(self, handler, ev: QQOfficeEvent) -> None:
+        try:
+            async with asyncio.timeout(self._handler_timeout):
+                await self._safe_call(handler, ev)
+        except TimeoutError:
+            self.handler_timeouts += 1
+            if self.logger:
+                self.logger.error(f"[qqoffice_expand] 事件处理器超时 ({ev.type})")
+
+    def _warn_dropped(self, kind: str, message: str, total: int) -> None:
+        """过载告警按类别限频：持续或再次过载时日志仍可见。"""
+        now = time.monotonic()
+        last = self._drop_warned.get(kind)
+        if self.logger and (last is None or now - last >= _DROP_WARN_INTERVAL):
+            self._drop_warned[kind] = now
+            self.logger.warning(f"[qqoffice_expand] {message}（累计 {total} 次）")
 
     async def _safe_call(self, handler, ev: QQOfficeEvent) -> None:
         try:
             result = handler(ev)
-            if inspect.isawaitable(result):
+            # 只等待协程：同步回调返回的 Task/Future 由回调自行管理，不占名额也不随超时取消。
+            if asyncio.iscoroutine(result):
                 await result
         except asyncio.CancelledError:
             raise
@@ -504,8 +516,7 @@ class EventBus:
         iid = str(iid)
         if self._ack_pending >= self._ack_limit:
             self.dropped_acks += 1
-            if self.logger and self.dropped_acks == 1:
-                self.logger.warning("[qqoffice_expand] 自动 ACK 并发已满，跳过新增应答")
+            self._warn_dropped("acks", "自动 ACK 并发已满，跳过新增应答", self.dropped_acks)
             return
         try:
             phase = AckReservation(state, iid)
@@ -551,7 +562,7 @@ class EventBus:
             },
             "counts": dict(self.counts),
             "auto_acked": self.auto_ack_total,
-            "active_handlers": sum(not task.done() for task in self._workers),
+            "active_handlers": sum(not task.done() for task in self._handler_tasks),
             "queued_handlers": len(self._queue),
             "dropped_handlers": self.dropped_handlers,
             "handler_timeouts": self.handler_timeouts,

@@ -14,7 +14,7 @@
 
 | 依赖 | 版本要求 | 说明 |
 | --- | --- | --- |
-| Python | >= 3.10 |  |
+| Python | >= 3.12 | 与 AstrBot 基线要求一致 |
 | AstrBot | 4.28.0-beta.1（commit `2aec78272cb8`）验证通过 | 多实例路由依赖 platform manager 的运行实例索引等内部结构，以该基线核实；未验证的未来版本不承诺 |
 | botpy | 1.2.1 | AstrBot 环境自带，无需单独安装 |
 
@@ -53,16 +53,16 @@ __平台支持__: 仅 QQ 官方机器人适配器（`qq_official` websocket 模�
 | `interaction_auto_ack` | bool | true | type=11/12 自动 code=0 应答；自定义结果应关闭，重复手动 ACK 抛 `QQOfficeDuplicateAck` |
 | `event_handler_concurrency` | int | 16 | 普通订阅回调并发上限，ACK 独立运行 |
 | `event_queue_size` | int | 1024 | 待执行回调上限；满时拒绝新增并计数 |
-| `event_handler_timeout` | float | 30.0 | 单个异步回调超时秒数，超时取消并计数 |
+| `event_handler_timeout` | float | 0 | 单个异步回调超时秒数，0 表示不限时；超时取消并计数 |
 | `interaction_ack_concurrency` | int | 128 | 自动 ACK 任务上限，满时跳过新增并计数 |
 | `enable_group_member_events` | bool | true | 订阅群成员进出事件（intent 1<<24）；修改后需重载适配器生效 |
 | `ref_ttl_days` | int | 7 | 引用索引本地留存天数；0 表示不落盘 |
 | `ref_max_entries` | int | 50000 | 引用索引全插件容量上限（不随实例数增长） |
 | `retry_max` | int | 3 | 频控自动等待重试上限；401/11244 token 重试固定 1 次 |
 
-群/C2C 发送序号由同身份实例共享，明确失败只退额度、不回收序号；显式 `msg_seq` 保留，流式续片沿用首片序号。有效窗口内同一互动只允许一个自动或手动 ACK；明确拒绝可重答，未知结果保留去重。
+群/C2C 发送序号由同身份实例共享，同一回复键首个序号取随机基数后递增（避开本体 1~10000 的随机序号），明确失败只退额度、不回收序号；显式 `msg_seq` 保留，流式续片未传序号时沿用首片序号。有效窗口内同一互动只允许一个自动或手动 ACK；明确拒绝可重答，未知结果保留去重。
 
-事件状态含 `active_handlers`、`queued_handlers`、`dropped_handlers`、`handler_timeouts`、`pending_acks` 和 `dropped_acks`。回调需要正常传播取消；同步阻塞回调无法由异步超时中断。
+事件状态含 `active_handlers`、`queued_handlers`、`dropped_handlers`、`handler_timeouts`、`pending_acks` 和 `dropped_acks`。每个回调在独立 Task 中运行，沿用投递时的上下文；只等待协程回调，同步回调返回的 Task 不占名额、不随超时取消。回调需要正常传播取消；同步阻塞回调无法由异步超时中断。
 
 插件合并同一 botpy Token 对象的过期及 401 刷新，不合并不同适配器的 Token；重载共享响应捕获状态，卸载按所有权恢复补丁并等待已有刷新结束。
 

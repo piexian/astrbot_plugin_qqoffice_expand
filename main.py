@@ -68,8 +68,7 @@ class Main(Star):
         self.event_bus = EventBus(self.config, logger)
         self.refstore: RefStore | None = None
         self._coordinator: asyncio.Task | None = None
-        self._terminating = False
-        self._terminated = asyncio.Event()
+        self._terminating: asyncio.Event | None = None   # 进行中的卸载，完成或失败时置位
         # 公开门面：构造后即可获取（state=initializing），生命周期见
         # core/plugin_service.py；旧 ready/status/wait_ready 由它驱动。
         self._service = QQOfficeService(self)
@@ -145,20 +144,22 @@ class Main(Star):
         )
 
     async def terminate(self) -> None:
-        if self._service.state == "closed":
-            return
-        if self._terminating:
-            # 被本次卸载等待的回调不能反过来等待卸载完成。
-            if asyncio.current_task() not in self.event_bus._tasks:
-                await self._terminated.wait()
-            return
-        self._terminating = True
-        self._service.mark_closing()
-        try:
-            await self._terminate()
-        finally:
-            self._service.mark_closed()
-            self._terminated.set()
+        while self._service.state != "closed":
+            if self._terminating is not None:
+                # 被本次卸载等待的回调不能反过来等待卸载完成。
+                if asyncio.current_task() in self.event_bus._tasks:
+                    return
+                await self._terminating.wait()
+                continue   # 上一次清理失败或被取消：由本调用重试
+            done = self._terminating = asyncio.Event()
+            self._service.mark_closing()
+            try:
+                await self._terminate()
+                # 清理全部完成才置 closed，否则后续 terminate 无法补做。
+                self._service.mark_closed()
+            finally:
+                self._terminating = None
+                done.set()
 
     async def _terminate(self) -> None:
         if self.routes is not None:
