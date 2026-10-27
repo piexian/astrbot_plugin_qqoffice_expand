@@ -1,7 +1,7 @@
-"""媒体归一与安全防护。
+"""媒体归一。
 
 to_uploadable(): URL / base64 / 本地路径 / bytes 归一为可上传对象
-assert_public_url(): 下载远程 URL 前的 SSRF 防护（内网段 + DNS 逐 IP 校验）
+  URL 只交给 QQ 文件接口由官方服务器拉取，插件不在本机下载，因此不做地址校验。
 strip_amr_header(): .amr 实为带 #!AMR 头的 SILK，发前剥头
 image_size(): 只读 64KB 头解析 PNG/JPEG/GIF/WebP 尺寸，默认 512x512
 """
@@ -18,7 +18,12 @@ from urllib.parse import urlparse
 
 from .errors import QQOfficeAPIError
 
-__all__ = ["Uploadable", "to_uploadable", "assert_public_url", "strip_amr_header", "image_size", "download_url"]
+__all__ = [
+    "Uploadable",
+    "to_uploadable",
+    "strip_amr_header",
+    "image_size",
+]
 
 DEFAULT_IMAGE_SIZE = (512, 512)
 _IMAGE_HEADER_LIMIT = 64 * 1024  # 只读头即够解析尺寸
@@ -44,7 +49,7 @@ class Uploadable:
         return self._bytes
 
     async def load_bytes(self) -> bytes:
-        """按需取得原始字节：base64/bytes 直接返回；path 读文件；url 走 SSRF 校验下载。"""
+        """按需取得原始字节：base64/bytes 直接返回；path 读文件；url 不在本机下载。"""
         if self._bytes is not None:
             return self._bytes
         if self.kind == "bytes":
@@ -57,7 +62,8 @@ class Uploadable:
                 raise QQOfficeAPIError(-1, f"本地文件不存在: {p}")
             data = p.read_bytes()
         elif self.kind == "url":
-            data = await download_url(str(self.source))
+            # 本机下载用户给的 URL 会引入 SSRF，URL 只能交给 QQ 服务器拉取。
+            raise QQOfficeAPIError(-1, "URL 来源由 QQ 服务器拉取，插件不在本机下载")
         else:
             raise QQOfficeAPIError(-1, f"未知上传来源类型: {self.kind}")
         self._bytes = data
@@ -96,7 +102,6 @@ def to_uploadable(source, *, filename: str | None = None, mime: str = "") -> Upl
     source = source.strip()
 
     if source.startswith(("http://", "https://")):
-        assert_public_url(source)
         name = filename or Path(urlparse(source).path).name or "file"
         return Uploadable("url", source, name, mime)
 
@@ -125,57 +130,6 @@ def _looks_like_base64(s: str) -> bool:
     except (binascii.Error, ValueError):
         return False
     return True
-
-def _is_reserved_ip(ip: str) -> bool:
-    import ipaddress
-
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return True
-    return (
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_reserved
-        or addr.is_multicast
-        or addr.is_unspecified
-    )
-
-def assert_public_url(url: str) -> None:
-    """校验 URL 公网可达性：仅 http(s)、拒绝保留网段，DNS 解析后逐 IP 校验。"""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise QQOfficeAPIError(-1, f"仅允许 http/https 外链: {url[:80]}")
-    host = parsed.hostname
-    if not host:
-        raise QQOfficeAPIError(-1, f"URL 缺少主机名: {url[:80]}")
-    import socket
-
-    try:
-        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
-    except OSError as e:
-        raise QQOfficeAPIError(-1, f"域名解析失败: {host} ({e})")
-    if not infos:
-        raise QQOfficeAPIError(-1, f"域名解析结果为空: {host}")
-    for info in infos:
-        ip = info[4][0]
-        if _is_reserved_ip(ip):
-            raise QQOfficeAPIError(-1, f"拒绝访问内网/保留地址: {host} -> {ip}")
-
-async def download_url(url: str, *, timeout: float = 30.0, max_bytes: int = 2 * 1024**3) -> bytes:
-    """SSRF 校验后下载远程资源。"""
-    assert_public_url(url)
-    import httpx
-
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-        resp = await client.get(url)
-        if resp.status_code >= 400:
-            raise QQOfficeAPIError(-1, f"下载失败 HTTP {resp.status_code}: {url[:80]}")
-        data = resp.content
-    if len(data) > max_bytes:
-        raise QQOfficeAPIError(-1, f"下载内容超过上限 {max_bytes} 字节")
-    return data
 
 # ---------------- AMR/SILK ----------------
 
