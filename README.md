@@ -275,7 +275,7 @@ astrbot_plugin_qqoffice_expand/
 │   ├── events.py        # EventBus（全局+实例订阅）、适配器协调挂载、自动 ACK
 │   ├── ratelimit.py     # 表驱动令牌桶 + 主动消息三级配额（按机器人身份）
 │   ├── refstore.py      # REFIDX 引用索引（身份命名空间 + 全局容量上限）
-│   ├── media.py         # to_uploadable / SSRF 防护 / AMR 剥头 / 图片尺寸解析
+│   ├── media.py         # to_uploadable / URL 下载 / AMR 剥头 / 图片尺寸解析
 │   ├── builders.py      # md / kb / btn / reference / md_image 构建器
 │   ├── registry.py      # 命名方法注册表（目录构建一次）
 │   ├── errors.py        # 错误标准化 + 路由错误类型

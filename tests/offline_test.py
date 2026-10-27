@@ -6,7 +6,6 @@ import struct
 import sys
 import tempfile
 import time
-from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -20,9 +19,9 @@ from core.registry import Registry, collect_methods
 from core.events import EVENT_SPECS, EventBus, normalize_event
 from api.group import GroupAPI
 from api.c2c import C2CAPI
-from api.guild import GuildAPI
 from api.manage import ManageAPI
-from core.routing import PassiveWindows, AckTracker
+from core.routing import PassiveWindows
+from core.ready import ReadySignal, wait_for_star
 
 ok = 0
 def t(name, cond, detail=None):
@@ -180,23 +179,13 @@ async def rl_test():
 asyncio.run(rl_test())
 
 # ---------- media ----------
-with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 443))]):
-    up = media.to_uploadable("https://example.com/a.png")
+up = media.to_uploadable("https://example.com/a.png")
 t("up url", up.kind == "url" and up.filename == "a.png")
 up2 = media.to_uploadable(base64.b64encode(b"hello world payload 0123456789abcdefghij" * 3).decode())
 t("up b64", up2.kind == "base64")
 up3 = media.to_uploadable(b"\x00\x01\x02")
 t("up bytes", up3.kind == "bytes" and up3.size == 3)
-try:
-    media.to_uploadable("https://127.0.0.1/x.png")
-    t("ssrf loopback", False)
-except errors.QQOfficeAPIError:
-    t("ssrf loopback", True)
-try:
-    media.to_uploadable("ftp://example.com/x")
-    t("ssrf scheme", False)
-except errors.QQOfficeAPIError:
-    t("ssrf scheme", True)
+t("up url 不再校验地址", media.to_uploadable("https://127.0.0.1/x.png").kind == "url")
 t("image_size gif", media.image_size(b"GIF89a" + struct.pack("<HH", 300, 200) + b"\x00" * 10) == (300, 200))
 t("image_size default", media.image_size(b"not-an-image") == (512, 512))
 amr = b"#!AMR\nSILK_PAYLOAD"
@@ -331,7 +320,6 @@ t("domain new", resolve_domain(prefer_new_domain=True) == "api.bot.qq.com")
 t("domain sandbox", resolve_domain(sandbox=True) == "sandbox.api.sgroup.qq.com")
 
 # ---------- ready ----------
-from core.ready import ReadySignal, wait_for_star
 
 rs = ReadySignal()
 t("ready initial", rs.is_ready is False)
